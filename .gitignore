@@ -1,0 +1,6 @@
+test_video/
+tools/descriptiongen/output
+.DS_Store
+.build/
+.venv/
+dist/
