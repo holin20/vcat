@@ -20,19 +20,40 @@ from mlx_vlm.utils import load_config
 MODEL_ID      = "mlx-community/Qwen2-VL-7B-Instruct-4bit"
 MAX_EDGE      = 512    # Resize longest edge to this (pixels). Lower = faster.
 JPEG_Q        = 65     # JPEG compression quality 1-100. Lower = smaller/faster.
-MAX_FRAMES    = 32     # Hard cap per clip (model context limit).
 MAX_TOKENS    = 1024   # Max tokens the model can generate per clip.
 FRAME_TMP     = "/tmp/vlm_frames"  # Base temp folder; each clip gets its own subfolder.
 
-DEFAULT_INPUT = "/Users/hchang/Movies/dubai/day2_camel_mini"
+DEFAULT_INPUT = "/Users/hchang/Movies/dubai/day2_camel"
+
+# Field values that are too generic to be useful — stripped from model output
+FILLER_VALUES = {"none", "n/a", "na", "static", "neutral", "normal", "unknown", "-"}
 
 # Prompt used for each frame — edit this to change what the model focuses on
 FRAME_PROMPT = (
-    "Describe the visual content of this frame in detail. "
-    "Include: location/setting, people and their actions, objects, camera angle, and lighting. "
-    "Be factual and specific. This description will be used as input to generate subtitles for a travel vlog."
-)
-# ─────────────────────────────────────────────
+    "Describe this video frame using the structure below. "
+    "Plain text only, no markdown. "
+    "ONLY include a field if it has something specific and notable to say. "
+    "OMIT fields that are unremarkable, unknown, or would be filled with 'none', 'n/a', 'static', 'normal', or 'neutral'.\n\n"
+    "setting: <indoor/outdoor, location type, environment>\n"
+    "people: <who is visible>\n"
+    "action: <what people or subjects are physically doing>\n"
+    "motion: <subject movement independent of camera>\n"
+    "intent: <the likely purpose or narrative meaning of this moment>\n"
+    "mood: <emotional atmosphere of the scene>\n"
+    "objects: <key objects visible>\n"
+    "text_in_frame: <any visible text, signs, labels, location names>\n"
+    "camera: <angle, movement, distance>\n"
+    "lighting: <quality, direction, time of day if outdoors>\n"
+    "sound_context: <inferred ambient sound based on visuals>\n\n"
+    "Example of a good minimal output:\n"
+    "setting: outdoor, desert, sandy dunes\n"
+    "people: male tourist, local handler\n"
+    "action: tourist reaching out to pet camel\n"
+    "mood: excited\n"
+    "objects: camel with red saddle\n"
+    "lighting: bright midday sun\n\n"
+    "This will be used as input to generate subtitles for a travel vlog."
+)# ─────────────────────────────────────────────
 
 # Script start time — used as output filename
 RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -102,7 +123,6 @@ def resize_frame(frame, max_edge: int):
 
 def extract_frames_at_1fps(
     video_path: Path,
-    max_frames: int = MAX_FRAMES,
     max_edge: int = MAX_EDGE,
     jpeg_quality: int = JPEG_Q,
 ) -> tuple[list[str], float]:
@@ -118,7 +138,7 @@ def extract_frames_at_1fps(
     duration    = frame_count / fps if fps > 0 else 0.0
 
     frame_paths = []
-    for second in range(min(int(duration), max_frames)):
+    for second in range(int(duration)):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(second * fps))
         ret, frame = cap.read()
         if not ret:
@@ -156,12 +176,32 @@ def collect_clips(inputs: list[str]) -> list[Path]:
 
 
 def save_log(log_file: Path, data: dict) -> float:
-    """Save JSON log. Returns time taken in seconds."""
-    print(f"[{get_now()}] 💾 Saving log → {log_file} ({len(data)} clip(s))...")
+    """Save YAML log. Returns time taken in seconds."""
+
+    # Use literal block scalar (|) for multiline strings so descriptions render
+    # as clean readable blocks instead of single-quoted escaped strings
+    class LiteralStr(str): pass
+
+    def literal_representer(dumper, data):
+        if "\n" in data:
+            return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+    yaml.add_representer(LiteralStr, literal_representer)
+
+    def wrap_descriptions(obj):
+        if isinstance(obj, dict):
+            return {k: LiteralStr(v) if k == "description" and isinstance(v, str) else wrap_descriptions(v)
+                    for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [wrap_descriptions(i) for i in obj]
+        return obj
+
+    print(f"[{get_now()}] 💾 Saving log → {log_file} ({len(data.get('clips', data))} clip(s))...")
     t0 = time.time()
     try:
         with open(log_file, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            yaml.dump(wrap_descriptions(data), f, allow_unicode=True, sort_keys=False, default_flow_style=False)
         elapsed = time.time() - t0
         size_kb = log_file.stat().st_size / 1024
         print(f"[{get_now()}] ✅ Log saved ({size_kb:.1f} KB, {elapsed*1000:.0f}ms)")
@@ -199,7 +239,6 @@ def run():
                         help="Skip interactive prompt by passing paths directly.")
     parser.add_argument("--max-edge",      type=int,  default=MAX_EDGE)
     parser.add_argument("--jpeg-quality",  type=int,  default=JPEG_Q)
-    parser.add_argument("--max-frames",    type=int,  default=MAX_FRAMES)
     parser.add_argument("--max-tokens",    type=int,  default=MAX_TOKENS)
     parser.add_argument("--no-cleanup",    action="store_true")
     args = parser.parse_args()
@@ -229,7 +268,7 @@ def run():
     # ── Load model ────────────────────────────────────────────────────────────
     print(f"[{get_now()}] 🚀 Loading {MODEL_ID} ...")
     print(f"[{get_now()}] ⚙️  Settings → max_edge={args.max_edge}px | "
-          f"jpeg_quality={args.jpeg_quality} | max_frames={args.max_frames}")
+          f"jpeg_quality={args.jpeg_quality}")
     t_load = time.time()
     model, processor = load(MODEL_ID)
     config = load_config(MODEL_ID)
@@ -250,7 +289,6 @@ def run():
         t0 = time.time()
         frames, duration = extract_frames_at_1fps(
             vid,
-            max_frames=args.max_frames,
             max_edge=args.max_edge,
             jpeg_quality=args.jpeg_quality,
         )
@@ -282,34 +320,58 @@ def run():
                     processor, config, FRAME_PROMPT, num_images=1
                 )
 
-                t_frame = time.time()
-                print(f"[{get_now()}] 🤖 Calling generate()...")
-                frame_res = generate(
-                    model,
-                    processor,
-                    formatted_prompt,
-                    image=frame_path,
-                    max_tokens=150,
-                    verbose=False,
-                )
-                t_frame_elapsed = time.time() - t_frame
+                # ── Per-frame retry ───────────────────────────────────────────
+                MAX_RETRIES = 3
+                text = None
+                t_frame_elapsed = 0.0
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        t_frame   = time.time()
+                        print(f"[{get_now()}] 🤖 Calling generate() (attempt {attempt}/{MAX_RETRIES})...")
+                        frame_res = generate(
+                            model,
+                            processor,
+                            formatted_prompt,
+                            image=frame_path,
+                            max_tokens=200,
+                            verbose=False,
+                        )
+                        t_frame_elapsed = time.time() - t_frame
 
-                print(f"[{get_now()}] 🤖 Raw result type : {type(frame_res)}")
-                print(f"[{get_now()}] 🤖 Raw result attrs: {[a for a in dir(frame_res) if not a.startswith('_')]}")
-                print(f"[{get_now()}] 🤖 Raw result value: {frame_res!r}")
+                        print(f"[{get_now()}] 🤖 Raw result type : {type(frame_res)}")
+                        print(f"[{get_now()}] 🤖 Raw result attrs: {[a for a in dir(frame_res) if not a.startswith('_')]}")
+                        print(f"[{get_now()}] 🤖 Raw result value: {frame_res!r}")
 
-                # Robustly extract text from whatever generate() returns
-                if hasattr(frame_res, "text"):
-                    text = frame_res.text.strip()
-                elif hasattr(frame_res, "generation"):
-                    text = frame_res.generation.strip()
-                elif isinstance(frame_res, str):
-                    text = frame_res.strip()
-                else:
-                    text = str(frame_res).strip()
+                        # Robustly extract text from whatever generate() returns
+                        if hasattr(frame_res, "text"):
+                            text = frame_res.text.strip()
+                        elif hasattr(frame_res, "generation"):
+                            text = frame_res.generation.strip()
+                        elif isinstance(frame_res, str):
+                            text = frame_res.strip()
+                        else:
+                            text = str(frame_res).strip()
+
+                        # Post-process: strip fields the model filled with filler values
+                        cleaned_lines = []
+                        for line in text.splitlines():
+                            if ":" in line:
+                                val = line.split(":", 1)[1].strip().lower()
+                                if val in FILLER_VALUES or not val:
+                                    continue
+                            cleaned_lines.append(line)
+                        text = "\n".join(cleaned_lines).strip()
+                        break  # success — exit retry loop
+
+                    except Exception as frame_err:
+                        print(f"[{get_now()}] ⚠️  Frame {i+1} attempt {attempt} failed: {frame_err}")
+                        if attempt == MAX_RETRIES:
+                            print(f"[{get_now()}] ❌ Frame {i+1} giving up after {MAX_RETRIES} attempts — recording as error")
+                            text = f"[ERROR after {MAX_RETRIES} attempts: {frame_err}]"
+                        else:
+                            time.sleep(1.0)  # brief pause before retry
 
                 print(f"[{get_now()}] ✏️  ({t_frame_elapsed:.2f}s) → {text[:100]}{'...' if len(text) > 100 else ''}")
-
                 visual_logs.append({
                     "timestamp":   round(global_second, 2),
                     "description": text,
@@ -332,12 +394,23 @@ def run():
             }
 
             clip_stats.t_save    = save_log(log_file, {"clips": master_results})
-            clip_stats.succeeded = (clip_stats.frames_described == clip_stats.frames_extracted)
+            clip_stats.succeeded = all(
+                not e["description"].startswith("[ERROR")
+                for e in visual_logs
+            )
 
         except Exception as e:
             import traceback
-            print(f"\n[{get_now()}] ❌ Failed on {vid.name}: {e}")
+            print(f"\n[{get_now()}] ❌ Clip-level failure on {vid.name}: {e}")
             traceback.print_exc()
+            # Record the failed clip in output so it's visible in the YAML
+            master_results[vid.name] = {
+                "global_start_time": round(global_offset, 2),
+                "duration":          round(duration, 2),
+                "error":             str(e),
+                "visual_logs":       visual_logs if visual_logs else [],
+            }
+            save_log(log_file, {"clips": master_results})
 
         finally:
             run_stats.clips.append(clip_stats)
@@ -355,10 +428,15 @@ def run():
     print(f"[{get_now()}] {'🏆' if all_ok else '⚠️ '} STAGE 1 {'COMPLETE' if all_ok else 'FINISHED WITH ERRORS'}")
     print(f"[{get_now()}] 📊 Clips succeeded: {clips_ok} / {clips_total}")
     for name, result in master_results.items():
-        expected = result["frames_analyzed"]
-        actual   = len(result["visual_logs"])
-        ok       = actual == expected
-        print(f"[{get_now()}] {'  ✅' if ok else '  ❌'} {name}: {actual}/{expected} frames described")
+        if "error" in result:
+            print(f"[{get_now()}]   ❌ {name}: clip-level error — {result['error']}")
+        else:
+            expected = result["frames_analyzed"]
+            actual   = len(result["visual_logs"])
+            errors   = sum(1 for e in result["visual_logs"] if e["description"].startswith("[ERROR"))
+            ok       = actual == expected and errors == 0
+            print(f"[{get_now()}] {'  ✅' if ok else '  ⚠️ '} {name}: {actual}/{expected} frames described" +
+                  (f", {errors} frame error(s)" if errors else ""))
     print(f"[{get_now()}] 📄 Log file: {log_file}")
 
     run_stats.print_summary()

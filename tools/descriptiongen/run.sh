@@ -32,16 +32,19 @@ else
     echo "✅ Packages already installed. Skipping."
 fi
 
+# --- CLEANUP ---
+cleanup() {
+    trap - SIGINT SIGTERM EXIT  # disarm to prevent re-triggering
+    echo -e "\n🧹 Releasing GPU and cleaning up..."
+    sudo sysctl iogpu.wired_limit_mb=0 > /dev/null 2>&1 || true
+    [[ -n "$VIRTUAL_ENV" ]] && deactivate
+    echo "✅ Done."
+}
+trap cleanup SIGINT SIGTERM EXIT
+
 # --- GPU ALLOCATION (requires sudo) ---
 echo "🔑 Allocating ${MODEL_LIMIT_MB}MB for GPU..."
 sudo sysctl iogpu.wired_limit_mb=$MODEL_LIMIT_MB
 
 # --- RUN ---
 python3 process_vlog.py "$@"
-
-# --- TEARDOWN ---
-echo "🧹 Releasing GPU (restoring dynamic management)..."
-sudo sysctl iogpu.wired_limit_mb=0 > /dev/null 2>&1 || true
-
-deactivate
-echo "✅ venv deactivated."
