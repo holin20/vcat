@@ -3,16 +3,14 @@ import os
 os.environ["HF_HUB_OFFLINE"] = "1"  # Skip HF network checks, model is cached locally
 
 import argparse
-import time
-import cv2
-import yaml
+import json
 import shutil
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from mlx_vlm import load, generate
-from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.utils import load_config
 
 # ─────────────────────────────────────────────
 #  CONFIG — tweak these to taste
@@ -23,7 +21,7 @@ JPEG_Q        = 65     # JPEG compression quality 1-100. Lower = smaller/faster.
 MAX_TOKENS    = 1024   # Max tokens the model can generate per clip.
 FRAME_TMP     = "/tmp/vlm_frames"  # Base temp folder; each clip gets its own subfolder.
 
-DEFAULT_INPUT = "/Users/hchang/Movies/dubai/day2_camel"
+DEFAULT_INPUT = "/Users/hchang/Movies/dubai/day2_camel_mini"
 
 # Field values that are too generic to be useful — stripped from model output
 FILLER_VALUES = {"none", "n/a", "na", "static", "neutral", "normal", "unknown", "-"}
@@ -32,6 +30,9 @@ FILLER_VALUES = {"none", "n/a", "na", "static", "neutral", "normal", "unknown", 
 FRAME_PROMPT = (
     "Describe this video frame using the structure below. "
     "Plain text only, no markdown. "
+    "Return ONE FIELD PER LINE. "
+    "Do NOT use separators like '|' or ';'. "
+    "Do NOT merge multiple fields onto one line. "
     "ONLY include a field if it has something specific and notable to say. "
     "OMIT fields that are unremarkable, unknown, or would be filled with 'none', 'n/a', 'static', 'normal', or 'neutral'.\n\n"
     "setting: <indoor/outdoor, location type, environment>\n"
@@ -57,10 +58,34 @@ FRAME_PROMPT = (
 
 # Script start time — used as output filename
 RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+ORIGINAL_STDOUT = sys.stdout
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 
 def get_now() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _cv2():
+    import cv2
+
+    return cv2
+
+
+def _load_vlm():
+    from mlx_vlm import load, generate
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from mlx_vlm.utils import load_config
+
+    return load, generate, apply_chat_template, load_config
+
+
+def to_srt_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(seconds * 1000)))
+    hh, rem_ms = divmod(total_ms, 3_600_000)
+    mm, rem_ms = divmod(rem_ms, 60_000)
+    ss, ms = divmod(rem_ms, 1000)
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
 
 # ── Stats tracking ────────────────────────────────────────────────────────────
@@ -118,6 +143,7 @@ def resize_frame(frame, max_edge: int):
     scale = max_edge / max(h, w)
     if scale >= 1.0:
         return frame
+    cv2 = _cv2()
     return cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
@@ -126,6 +152,7 @@ def extract_frames_at_1fps(
     max_edge: int = MAX_EDGE,
     jpeg_quality: int = JPEG_Q,
 ) -> tuple[list[str], float]:
+    cv2 = _cv2()
     clip_tmp = os.path.join(FRAME_TMP, video_path.stem)
     os.makedirs(clip_tmp, exist_ok=True)
 
@@ -177,6 +204,7 @@ def collect_clips(inputs: list[str]) -> list[Path]:
 
 def save_log(log_file: Path, data: dict) -> float:
     """Save YAML log. Returns time taken in seconds."""
+    import yaml
 
     # Use literal block scalar (|) for multiline strings so descriptions render
     # as clean readable blocks instead of single-quoted escaped strings
@@ -211,6 +239,235 @@ def save_log(log_file: Path, data: dict) -> float:
         return 0.0
 
 
+def output_log_path() -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return OUTPUT_DIR / f"{RUN_TS}.yaml"
+
+
+def build_clip_record(
+    *,
+    clip_path: str,
+    global_start_time: float,
+    duration: float,
+    frames_analyzed: int,
+    max_edge: int,
+    jpeg_quality: int,
+    visual_logs: list[dict],
+    engine: str = "mlx_vlm_qwen2_vl",
+    warnings: list[str] | None = None,
+    error: str | None = None,
+) -> dict:
+    record = {
+        "input_path": clip_path,
+        "global_start_time": round(global_start_time, 2),
+        "duration": round(duration, 2),
+        "frames_analyzed": frames_analyzed,
+        "frame_resolution": f"max_edge={max_edge}px",
+        "jpeg_quality": jpeg_quality,
+        "visual_logs": visual_logs,
+        "engine": engine,
+        "warnings": warnings or [],
+    }
+    if error:
+        record["error"] = error
+    return record
+
+
+def yaml_clips_from_app_results(results: list[dict], max_edge: int, jpeg_quality: int) -> dict:
+    clips: dict = {}
+    global_offset = 0.0
+
+    for item in results:
+        input_path = item.get("input_path")
+        if not input_path:
+            continue
+        clip_path = Path(input_path)
+        scenes = item.get("scenes") or []
+        duration = 0.0
+        visual_logs = []
+        for scene in scenes:
+            start_sec = float(scene.get("start_sec") or 0.0)
+            end_sec = float(scene.get("end_sec") or start_sec)
+            duration = max(duration, end_sec)
+            visual_logs.append(
+                {
+                    "timestamp": to_srt_timestamp(global_offset + start_sec),
+                    "description": scene.get("caption", "") or "",
+                }
+            )
+
+        clips[clip_path.name] = build_clip_record(
+            clip_path=str(clip_path),
+            global_start_time=global_offset,
+            duration=duration,
+            frames_analyzed=len(scenes),
+            max_edge=max_edge,
+            jpeg_quality=jpeg_quality,
+            visual_logs=visual_logs,
+            engine=item.get("engine", "mlx_vlm_qwen2_vl") or "mlx_vlm_qwen2_vl",
+            warnings=item.get("warnings") or [],
+            error=item.get("error"),
+        )
+        global_offset += duration
+
+    return {"clips": clips}
+
+
+def ffprobe_duration(video_path: Path) -> float:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return max(float(result.stdout.strip()), 0.0)
+    except Exception:
+        return 0.0
+
+
+def clip_sentence(description: str) -> str:
+    text = " ".join((description or "").split())
+    if not text:
+        return ""
+    if ":" in text:
+        parts = []
+        normalized = (description or "").replace("\r\n", "\n").replace("\r", "\n")
+        source_lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+        if not source_lines:
+            source_lines = [line.strip() for line in text.split(" | ") if line.strip()]
+        for line in source_lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                value = value.strip()
+                if value:
+                    parts.append(f"{key.strip()} {value}")
+            elif line.strip():
+                parts.append(line.strip())
+        if parts:
+            text = ", ".join(parts)
+    return text.rstrip(".")
+
+
+def summarize_clip(clip_name: str, duration: float, visual_logs: list[dict], max_words: int) -> str:
+    snippets: list[str] = []
+    for entry in visual_logs:
+        sentence = clip_sentence(entry.get("description", ""))
+        if sentence and sentence not in snippets:
+            snippets.append(sentence)
+        if len(snippets) >= 4:
+            break
+
+    if snippets:
+        summary = f"{clip_name} runs about {duration:.0f} seconds. Highlights: " + "; ".join(snippets) + "."
+    else:
+        summary = f"{clip_name} runs about {duration:.0f} seconds with limited visual details detected."
+
+    words = summary.split()
+    if len(words) <= max_words:
+        return summary
+    return " ".join(words[:max_words]).rstrip(".,;:") + "..."
+
+
+def analyze_clip_for_app(
+    video_path: Path,
+    max_words: int,
+    max_edge: int,
+    jpeg_quality: int,
+    max_tokens: int,
+    model_bundle=None,
+) -> dict:
+    if model_bundle is None:
+        load, _generate, _apply_chat_template, load_config = _load_vlm()
+        print(f"[{get_now()}] 🚀 Loading {MODEL_ID} ...")
+        t_load = time.time()
+        model, processor = load(MODEL_ID)
+        config = load_config(MODEL_ID)
+        print(f"[{get_now()}] ✅ Model loaded ({time.time() - t_load:.2f}s)")
+    else:
+        model, processor, config = model_bundle
+    _, generate, apply_chat_template, _ = _load_vlm()
+
+    frames, duration = extract_frames_at_1fps(video_path, max_edge=max_edge, jpeg_quality=jpeg_quality)
+    if not frames:
+        raise RuntimeError(f"Could not extract frames from {video_path.name}")
+
+    visual_logs: list[dict] = []
+    try:
+        for i, frame_path in enumerate(frames):
+            formatted_prompt = apply_chat_template(processor, config, FRAME_PROMPT, num_images=1)
+            print(f"[{get_now()}] 🤖 Frame {i + 1}/{len(frames)}: {frame_path}")
+            frame_res = generate(
+                model,
+                processor,
+                formatted_prompt,
+                image=frame_path,
+                max_tokens=max_tokens,
+                verbose=False,
+            )
+            if hasattr(frame_res, "text"):
+                text = frame_res.text.strip()
+            elif hasattr(frame_res, "generation"):
+                text = frame_res.generation.strip()
+            elif isinstance(frame_res, str):
+                text = frame_res.strip()
+            else:
+                text = str(frame_res).strip()
+
+            cleaned_lines = []
+            for line in text.splitlines():
+                if ":" in line:
+                    val = line.split(":", 1)[1].strip().lower()
+                    if val in FILLER_VALUES or not val:
+                        continue
+                cleaned_lines.append(line.strip())
+            cleaned = "\n".join(line for line in cleaned_lines if line).strip()
+            visual_logs.append(
+                {
+                    "timestamp": to_srt_timestamp(float(i)),
+                    "description": cleaned,
+                }
+            )
+    finally:
+        cleanup_frames(frames)
+
+    description = summarize_clip(video_path.name, duration or ffprobe_duration(video_path), visual_logs, max_words)
+    scenes = []
+    for index, entry in enumerate(visual_logs):
+        caption = entry["description"]
+        if not caption:
+            continue
+        start = float(index)
+        end = start + 1.0
+        scenes.append(
+            {
+                "index": index,
+                "start_sec": start,
+                "end_sec": end,
+                "mid_sec": start + 0.5,
+                "caption": caption,
+            }
+        )
+
+    return {
+        "input_path": str(video_path),
+        "description": description,
+        "engine": "mlx_vlm_qwen2_vl",
+        "scene_count": len(scenes),
+        "scenes": scenes,
+        "warnings": [],
+    }
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def prompt_input() -> list[str]:
@@ -241,7 +498,67 @@ def run():
     parser.add_argument("--jpeg-quality",  type=int,  default=JPEG_Q)
     parser.add_argument("--max-tokens",    type=int,  default=MAX_TOKENS)
     parser.add_argument("--no-cleanup",    action="store_true")
+    parser.add_argument("--max-words",     type=int,  default=120)
+    parser.add_argument("--lang",          default="en")
+    parser.add_argument("--segment-sec",   type=float, default=1.0)
+    parser.add_argument("--engine",        default="auto")
+    parser.add_argument("--json-output",   action="store_true",
+                        help="Emit one JSON payload to stdout for app integration.")
     args = parser.parse_args()
+
+    if args.json_output:
+        sys.stdout = sys.stderr
+        input_paths = args.input if args.input else prompt_input()
+        all_clips = collect_clips(input_paths)
+        if not all_clips:
+            payload = {
+                "error": "No valid input clips found for --json-output mode.",
+                "warnings": [],
+            }
+            print(json.dumps(payload), file=ORIGINAL_STDOUT)
+            return
+
+        load, _generate, _apply_chat_template, load_config = _load_vlm()
+        try:
+            print(f"[{get_now()}] 🚀 Loading {MODEL_ID} ...")
+            t_load = time.time()
+            model, processor = load(MODEL_ID)
+            config = load_config(MODEL_ID)
+            print(f"[{get_now()}] ✅ Model loaded ({time.time() - t_load:.2f}s)")
+            model_bundle = (model, processor, config)
+
+            results = []
+            for clip in all_clips:
+                try:
+                    results.append(
+                        analyze_clip_for_app(
+                            clip,
+                            max_words=args.max_words,
+                            max_edge=args.max_edge,
+                            jpeg_quality=args.jpeg_quality,
+                            max_tokens=args.max_tokens,
+                            model_bundle=model_bundle,
+                        )
+                    )
+                except Exception as exc:
+                    results.append(
+                        {
+                            "input_path": str(clip),
+                            "error": str(exc),
+                            "warnings": [str(exc)],
+                            "scenes": [],
+                        }
+                    )
+            log_file = output_log_path()
+            save_log(log_file, yaml_clips_from_app_results(results, args.max_edge, args.jpeg_quality))
+            payload = yaml_clips_from_app_results(results, args.max_edge, args.jpeg_quality)
+        except Exception as exc:
+            payload = {
+                "error": str(exc),
+                "warnings": [str(exc)],
+            }
+        print(json.dumps(payload, ensure_ascii=False), file=ORIGINAL_STDOUT)
+        return
 
     # ── Input — interactive if not passed as args ─────────────────────────────
     input_paths = args.input if args.input else prompt_input()
@@ -259,7 +576,7 @@ def run():
         print(f"             → {c}")
 
     # ── Output location: ./output/<RUN_TS>.json (relative to cwd) ───────────
-    output_dir = Path("output")
+    output_dir = OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     log_file   = output_dir / f"{RUN_TS}.yaml"
     print(f"[{get_now()}] 📁 Output dir : {output_dir} (exists={output_dir.exists()})")
@@ -270,6 +587,7 @@ def run():
     print(f"[{get_now()}] ⚙️  Settings → max_edge={args.max_edge}px | "
           f"jpeg_quality={args.jpeg_quality}")
     t_load = time.time()
+    load, generate, apply_chat_template, load_config = _load_vlm()
     model, processor = load(MODEL_ID)
     config = load_config(MODEL_ID)
     run_stats.t_model_load = time.time() - t_load
@@ -373,7 +691,7 @@ def run():
 
                 print(f"[{get_now()}] ✏️  ({t_frame_elapsed:.2f}s) → {text[:100]}{'...' if len(text) > 100 else ''}")
                 visual_logs.append({
-                    "timestamp":   round(global_second, 2),
+                    "timestamp":   to_srt_timestamp(global_second),
                     "description": text,
                 })
 
@@ -382,16 +700,19 @@ def run():
 
             print(f"\n[{get_now()}] 📝 visual_logs: {len(visual_logs)} entries")
             for entry in visual_logs:
-                print(f"             t={entry['timestamp']}s | {entry['description'][:80]}")
+                print(f"             t={entry['timestamp']} | {entry['description'][:80]}")
 
-            master_results[vid.name] = {
-                "global_start_time": round(global_offset, 2),
-                "duration":          round(duration, 2),
-                "frames_analyzed":   len(frames),
-                "frame_resolution":  f"max_edge={args.max_edge}px",
-                "jpeg_quality":      args.jpeg_quality,
-                "visual_logs":       visual_logs,
-            }
+            master_results[vid.name] = build_clip_record(
+                clip_path=str(vid),
+                global_start_time=global_offset,
+                duration=duration,
+                frames_analyzed=len(frames),
+                max_edge=args.max_edge,
+                jpeg_quality=args.jpeg_quality,
+                visual_logs=visual_logs,
+                engine="mlx_vlm_qwen2_vl",
+                warnings=[],
+            )
 
             clip_stats.t_save    = save_log(log_file, {"clips": master_results})
             clip_stats.succeeded = all(
@@ -404,12 +725,18 @@ def run():
             print(f"\n[{get_now()}] ❌ Clip-level failure on {vid.name}: {e}")
             traceback.print_exc()
             # Record the failed clip in output so it's visible in the YAML
-            master_results[vid.name] = {
-                "global_start_time": round(global_offset, 2),
-                "duration":          round(duration, 2),
-                "error":             str(e),
-                "visual_logs":       visual_logs if visual_logs else [],
-            }
+            master_results[vid.name] = build_clip_record(
+                clip_path=str(vid),
+                global_start_time=global_offset,
+                duration=duration,
+                frames_analyzed=len(visual_logs),
+                max_edge=args.max_edge,
+                jpeg_quality=args.jpeg_quality,
+                visual_logs=visual_logs if visual_logs else [],
+                engine="mlx_vlm_qwen2_vl",
+                warnings=[str(e)],
+                error=str(e),
+            )
             save_log(log_file, {"clips": master_results})
 
         finally:

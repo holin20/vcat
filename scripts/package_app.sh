@@ -18,7 +18,9 @@ mkdir -p "$RESOURCES_DIR"
 
 cp "$BUILD_DIR/$EXEC_NAME" "$MACOS_DIR/$EXEC_NAME"
 chmod +x "$MACOS_DIR/$EXEC_NAME"
-cp "$ROOT_DIR/scripts/video_understanding.py" "$RESOURCES_DIR/video_understanding.py"
+cp "$ROOT_DIR/tools/descriptiongen/run.sh" "$RESOURCES_DIR/descriptiongen_run.sh"
+cp "$ROOT_DIR/tools/descriptiongen/process_vlog.py" "$RESOURCES_DIR/process_vlog.py"
+chmod +x "$RESOURCES_DIR/descriptiongen_run.sh"
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

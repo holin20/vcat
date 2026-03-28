@@ -498,6 +498,14 @@ private enum ClipAnalysisCacheStore {
             // Cache is a best-effort optimization; ignore write failures.
         }
     }
+
+    static func remove(url: URL, lang: String, maxWords: Int, segmentSeconds: Double) {
+        guard let dir = cacheDir(),
+              let fp = fileFingerprint(for: url) else { return }
+        let k = key(for: url, size: fp.size, mtime: fp.mtime, lang: lang, maxWords: maxWords, segmentSeconds: segmentSeconds)
+        let path = dir.appendingPathComponent("\(k).json")
+        try? FileManager.default.removeItem(at: path)
+    }
 }
 
 @MainActor
@@ -556,7 +564,9 @@ final class VideoMergeViewModel: ObservableObject {
     @Published var subtitleBackgroundOpacity = 0.62
     @Published var isExporting = false
     @Published var isGeneratingDescriptions = false
+    @Published var isConfiguringGPULimit = false
     @Published var statusMessage = "Choose videos and export."
+    @Published var statusDetail: String? = nil
     @Published var importedSubtitleEntries: [TimedScriptEntry] = []
     @Published var importedSRTPath: String? = nil
 
@@ -711,7 +721,7 @@ final class VideoMergeViewModel: ObservableObject {
         clipDurations.removeAll()
     }
 
-    func generateDescriptionsForAll() {
+    func generateDescriptionsForAll(forceRefresh: Bool = false) {
         guard !selectedURLs.isEmpty else {
             statusMessage = "No videos selected."
             return
@@ -719,52 +729,66 @@ final class VideoMergeViewModel: ObservableObject {
         guard !isGeneratingDescriptions else { return }
 
         isGeneratingDescriptions = true
-        statusMessage = "Generating clip descriptions..."
+        statusMessage = forceRefresh ? "Regenerating clip descriptions..." : "Generating clip descriptions..."
+        statusDetail = "Running local analyzer. If a macOS admin dialog appeared, approve it to continue."
         let urls = selectedURLs
+        if forceRefresh {
+            invalidateCachedAnalyses(for: urls)
+        }
 
         Task<Void, Never> {
-            for url in urls {
-                    do {
-                    let result = try await ClipDescriptionBuilder.describe(
-                        url: url,
-                        pythonExec: resolvedPythonExec(),
-                        maxWords: descriptionMaxWords,
-                        language: descriptionLanguage,
-                        segmentSeconds: analysisSegmentSeconds,
-                        engine: descriptionEngine
-                    )
-                    await MainActor.run {
+            let results = await ClipDescriptionBuilder.describeAll(
+                urls: urls,
+                pythonExec: resolvedPythonExec(),
+                maxWords: descriptionMaxWords,
+                language: descriptionLanguage,
+                segmentSeconds: analysisSegmentSeconds,
+                engine: descriptionEngine
+            )
+            await MainActor.run {
+                for (url, outcome) in results {
+                    switch outcome {
+                    case .success(let result):
                         if self.debugLoggingEnabled {
                             for line in result.debugLines {
                                 self.appendLog(line)
                             }
                         }
-                        self.clipDescriptions[url] = result.description
-                        self.clipEngines[url] = result.engine
-                        self.clipWarnings[url] = result.warnings
-                        self.clipScenes[url] = result.scenes
+                        self.updateAnalysisState(
+                            for: url,
+                            description: result.description,
+                            engine: result.engine,
+                            warnings: result.warnings,
+                            scenes: result.scenes
+                        )
                         self.persistAnalysisToCache(url: url, result: result)
                         if self.clipScripts[url, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             self.clipScripts[url] = DraftScriptBuilder.draft(from: result.description, fallbackFilename: url.deletingPathExtension().lastPathComponent)
                         }
-                    }
-                } catch {
-                    await MainActor.run {
-                        self.clipDescriptions[url] = "Unable to describe this clip automatically."
-                        self.clipEngines[url] = nil
-                        self.clipWarnings[url] = ["\(error.localizedDescription)"]
-                        self.clipScenes[url] = []
+                    case .failure(let error):
+                        self.updateAnalysisState(
+                            for: url,
+                            description: "Unable to describe this clip automatically.",
+                            engine: nil,
+                            warnings: ["\(error.localizedDescription)"],
+                            scenes: []
+                        )
                         if self.debugLoggingEnabled {
                             self.appendLog("Describe failed: \(url.path) error=\(error.localizedDescription)")
                         }
                     }
                 }
-            }
-            await MainActor.run {
                 self.isGeneratingDescriptions = false
-                self.statusMessage = "Descriptions generated for \(urls.count) clip(s)."
+                self.statusDetail = nil
+                self.statusMessage = forceRefresh
+                    ? "Descriptions regenerated for \(urls.count) clip(s)."
+                    : "Descriptions generated for \(urls.count) clip(s)."
             }
         }
+    }
+
+    func regenerateDescriptionsForAll() {
+        generateDescriptionsForAll(forceRefresh: true)
     }
 
     func generateDescription(for url: URL) {
@@ -772,6 +796,7 @@ final class VideoMergeViewModel: ObservableObject {
 
         isGeneratingDescriptions = true
         statusMessage = "Generating description for \(url.lastPathComponent)..."
+        statusDetail = "Running local analyzer. If a macOS admin dialog appeared, approve it to continue."
 
         Task<Void, Never> {
             do {
@@ -789,27 +814,35 @@ final class VideoMergeViewModel: ObservableObject {
                             self.appendLog(line)
                         }
                     }
-                    self.clipDescriptions[url] = result.description
-                    self.clipEngines[url] = result.engine
-                    self.clipWarnings[url] = result.warnings
-                    self.clipScenes[url] = result.scenes
+                    self.updateAnalysisState(
+                        for: url,
+                        description: result.description,
+                        engine: result.engine,
+                        warnings: result.warnings,
+                        scenes: result.scenes
+                    )
                     self.persistAnalysisToCache(url: url, result: result)
                     if self.clipScripts[url, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         self.clipScripts[url] = DraftScriptBuilder.draft(from: result.description, fallbackFilename: url.deletingPathExtension().lastPathComponent)
                     }
                     self.isGeneratingDescriptions = false
+                    self.statusDetail = nil
                     self.statusMessage = "Description generated for \(url.lastPathComponent)."
                 }
             } catch {
                 await MainActor.run {
-                    self.clipDescriptions[url] = "Unable to describe this clip automatically."
-                    self.clipEngines[url] = nil
-                    self.clipWarnings[url] = ["\(error.localizedDescription)"]
-                    self.clipScenes[url] = []
+                    self.updateAnalysisState(
+                        for: url,
+                        description: "Unable to describe this clip automatically.",
+                        engine: nil,
+                        warnings: ["\(error.localizedDescription)"],
+                        scenes: []
+                    )
                     if self.debugLoggingEnabled {
                         self.appendLog("Describe failed: \(url.path) error=\(error.localizedDescription)")
                     }
                     self.isGeneratingDescriptions = false
+                    self.statusDetail = nil
                     self.statusMessage = "Description failed for \(url.lastPathComponent)."
                 }
             }
@@ -838,6 +871,43 @@ final class VideoMergeViewModel: ObservableObject {
         }
     }
 
+    private func updateAnalysisState(
+        for url: URL,
+        description: String?,
+        engine: String?,
+        warnings: [String]?,
+        scenes: [ClipSceneCaption]?
+    ) {
+        var descriptions = clipDescriptions
+        descriptions[url] = description
+        clipDescriptions = descriptions
+
+        var engines = clipEngines
+        engines[url] = engine
+        clipEngines = engines
+
+        var warningMap = clipWarnings
+        warningMap[url] = warnings
+        clipWarnings = warningMap
+
+        var sceneMap = clipScenes
+        sceneMap[url] = scenes
+        clipScenes = sceneMap
+    }
+
+    private func invalidateCachedAnalyses(for urls: [URL]) {
+        let lang = descriptionLanguage.analyzerArg
+        let maxWords = descriptionMaxWords
+        let segment = analysisSegmentSeconds
+        for url in urls {
+            ClipAnalysisCacheStore.remove(url: url, lang: lang, maxWords: maxWords, segmentSeconds: segment)
+            updateAnalysisState(for: url, description: nil, engine: nil, warnings: nil, scenes: nil)
+            if debugLoggingEnabled {
+                appendLog("Cache cleared: \(url.lastPathComponent) (\(lang), \(maxWords)w, \(segment)s)")
+            }
+        }
+    }
+
     private func preloadCachedAnalyses(for urls: [URL]) {
         let lang = descriptionLanguage.analyzerArg
         let maxWords = descriptionMaxWords
@@ -845,10 +915,13 @@ final class VideoMergeViewModel: ObservableObject {
         for url in urls {
             guard clipDescriptions[url] == nil else { continue }
             guard let cached = ClipAnalysisCacheStore.load(url: url, lang: lang, maxWords: maxWords, segmentSeconds: segment) else { continue }
-            clipDescriptions[url] = cached.description
-            clipEngines[url] = cached.engine
-            clipWarnings[url] = cached.warnings
-            clipScenes[url] = cached.scenes
+            updateAnalysisState(
+                for: url,
+                description: cached.description,
+                engine: cached.engine,
+                warnings: cached.warnings,
+                scenes: cached.scenes
+            )
             if debugLoggingEnabled {
                 appendLog("Cache hit: \(url.lastPathComponent) (\(cached.lang), \(cached.maxWords)w, \(cached.segmentSeconds)s)")
             }
@@ -1297,10 +1370,43 @@ final class VideoMergeViewModel: ObservableObject {
                 guard !text.isEmpty else { return nil }
                 let start = ClipDescriptionBuilder.formatDuration(max(scene.startSeconds, 0))
                 let end = ClipDescriptionBuilder.formatDuration(max(scene.endSeconds, scene.startSeconds))
-                return "\(start)–\(end) \(text)"
+                let normalized = text
+                    .replacingOccurrences(of: "\r\n", with: "\n")
+                    .replacingOccurrences(of: "\r", with: "\n")
+                let body = normalized
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map { "  " + String($0) }
+                    .joined(separator: "\n")
+                return "[\(start) - \(end)]\n\(body)"
             }
         if lines.isEmpty { return nil }
-        return lines.joined(separator: "\n")
+        return lines.joined(separator: "\n\n")
+    }
+
+    func formattedDescription(for url: URL) -> String? {
+        guard let raw = clipDescriptions[url]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
+
+        var text = raw
+            .replacingOccurrences(of: " Highlights: ", with: "\n\nHighlights:\n")
+            .replacingOccurrences(of: "; ", with: "\n• ")
+            .replacingOccurrences(of: "setting ", with: "setting: ")
+            .replacingOccurrences(of: "people ", with: "people: ")
+            .replacingOccurrences(of: "action ", with: "action: ")
+            .replacingOccurrences(of: "motion ", with: "motion: ")
+            .replacingOccurrences(of: "intent ", with: "intent: ")
+            .replacingOccurrences(of: "mood ", with: "mood: ")
+            .replacingOccurrences(of: "objects ", with: "objects: ")
+            .replacingOccurrences(of: "text_in_frame ", with: "text_in_frame: ")
+            .replacingOccurrences(of: "camera ", with: "camera: ")
+            .replacingOccurrences(of: "lighting ", with: "lighting: ")
+            .replacingOccurrences(of: "sound_context ", with: "sound_context: ")
+
+        if text.contains("\n• ") {
+            text = text.replacingOccurrences(of: "\n\nHighlights:\n", with: "\n\nHighlights:\n• ")
+        }
+
+        return text
     }
 
     func targetWordsText(for url: URL) -> String {
@@ -1431,6 +1537,16 @@ final class VideoMergeViewModel: ObservableObject {
             let script = SubtitleSidecarWriter.makeNarrationDocument(entries: buildTimedEntries(), totalDuration: artifacts.totalDuration)
             try script.write(to: baseURL.appendingPathExtension("md"), atomically: true, encoding: .utf8)
         }
+
+        let yaml = RawDescriptionSidecarWriter.makeYAML(
+            urls: selectedURLs,
+            clipDescriptions: clipDescriptions,
+            clipScenes: clipScenes,
+            clipDurations: clipDurations,
+            clipEngines: clipEngines,
+            clipWarnings: clipWarnings
+        )
+        try yaml.write(to: baseURL.appendingPathExtension("yaml"), atomically: true, encoding: .utf8)
     }
 
     private var currentSubtitleStyle: SubtitleStyle {
@@ -1474,6 +1590,80 @@ final class VideoMergeViewModel: ObservableObject {
         statusMessage = "Python set to: .venv"
     }
 
+    func enableGPUMemoryBoost() {
+        setGPUMemoryLimit(18000)
+    }
+
+    func resetGPUMemoryBoost() {
+        setGPUMemoryLimit(0)
+    }
+
+    private func setGPUMemoryLimit(_ megabytes: Int) {
+        guard !isConfiguringGPULimit else { return }
+        isConfiguringGPULimit = true
+        statusMessage = megabytes > 0 ? "Enabling GPU boost..." : "Resetting GPU boost..."
+        statusDetail = "A macOS admin dialog may appear."
+
+        Task<Void, Never> {
+            let result = await Self.runPrivilegedSysctl(iogpuWiredLimitMB: megabytes)
+            await MainActor.run {
+                self.isConfiguringGPULimit = false
+                self.statusDetail = nil
+                switch result {
+                case .success:
+                    self.statusMessage = megabytes > 0
+                        ? "GPU boost enabled (\(megabytes) MB)."
+                        : "GPU boost reset."
+                case .failure(let error):
+                    self.statusMessage = "GPU boost change failed: \(error.localizedDescription)"
+                    if self.debugLoggingEnabled {
+                        self.appendLog("GPU boost failed: value=\(megabytes) error=\(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    private static func runPrivilegedSysctl(iogpuWiredLimitMB: Int) async -> Result<Void, Error> {
+        await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            let shellCommand = "/usr/sbin/sysctl iogpu.wired_limit_mb=\(iogpuWiredLimitMB)"
+            let escaped = shellCommand
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            process.arguments = [
+                "-e",
+                "do shell script \"\(escaped)\" with administrator privileges"
+            ]
+
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                if process.terminationStatus == 0 {
+                    return .success(())
+                }
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let message = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nilIfEmpty
+                    ?? String(data: outData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nilIfEmpty
+                    ?? "Administrator command exited with status \(process.terminationStatus)."
+                return .failure(VideoMergeError.exportFailed(message))
+            } catch {
+                return .failure(error)
+            }
+        }.value
+    }
+
     private func timestamp() -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1489,11 +1679,29 @@ final class VideoMergeViewModel: ObservableObject {
         debugLog = ""
     }
 
+    var recentDebugLines: [String] {
+        debugLog
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .suffix(20)
+            .map(String.init)
+    }
+
     func copyLogToClipboard() {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(debugLog, forType: .string)
         statusMessage = "Debug log copied."
+    }
+
+    var analyzerOutputDirectoryPath: String {
+        guard let script = ClipDescriptionBuilder.analyzerScriptURL() else { return "Unavailable" }
+        return script.deletingLastPathComponent().appendingPathComponent("output", isDirectory: true).path
+    }
+
+    func openAnalyzerOutputFolder() {
+        let url = URL(fileURLWithPath: analyzerOutputDirectoryPath, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(url)
     }
 
     func saveLogToFile() {
@@ -1515,10 +1723,10 @@ final class VideoMergeViewModel: ObservableObject {
         appendLog("Bundle: \(Bundle.main.bundleURL.path)")
         appendLog("CWD: \(FileManager.default.currentDirectoryPath)")
         appendLog("Python setting: \(pythonInterpreterPath.isEmpty ? "python3" : pythonInterpreterPath)")
-        if let script = Bundle.main.url(forResource: "video_understanding", withExtension: "py") {
-            appendLog("Analyzer script (bundled): \(script.path)")
+        if let script = ClipDescriptionBuilder.analyzerScriptURL() {
+            appendLog("Analyzer script: \(script.path)")
         } else {
-            appendLog("Analyzer script (bundled): missing")
+            appendLog("Analyzer script: missing")
         }
     }
 
@@ -1580,6 +1788,12 @@ enum VideoMergeError: LocalizedError {
         case .exportFailed(let reason):
             return "Export failed: \(reason)"
         }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }
 
@@ -2430,7 +2644,127 @@ enum SubtitleSidecarWriter {
     }
 }
 
+enum RawDescriptionSidecarWriter {
+    private static let analyzerMaxEdge = 512
+    private static let analyzerJPEGQuality = 65
+
+    static func makeYAML(
+        urls: [URL],
+        clipDescriptions: [URL: String],
+        clipScenes: [URL: [ClipSceneCaption]],
+        clipDurations: [URL: Double],
+        clipEngines: [URL: String],
+        clipWarnings: [URL: [String]]
+    ) -> String {
+        var lines: [String] = ["clips:"]
+        var globalOffset: Double = 0
+
+        for url in urls {
+            let filename = url.lastPathComponent
+            let duration = max(clipDurations[url] ?? 0, 0)
+            let scenes = (clipScenes[url] ?? []).sorted { $0.startSeconds < $1.startSeconds }
+            let engine = clipEngines[url]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let warnings = (clipWarnings[url] ?? [])
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+
+            lines.append("  \(yamlKey(filename)):")
+            lines.append("    source_path: \(yamlString(url.path))")
+            lines.append("    global_start_time: \(decimal(globalOffset))")
+            lines.append("    duration: \(decimal(duration))")
+            if !engine.isEmpty {
+                lines.append("    engine: \(yamlString(engine))")
+            }
+            if warnings.isEmpty {
+                lines.append("    warnings: []")
+            } else {
+                lines.append("    warnings:")
+                for warning in warnings {
+                    lines.append("    - \(yamlString(warning))")
+                }
+            }
+            lines.append("    frames_analyzed: \(scenes.count)")
+            lines.append("    frame_resolution: \(yamlString("max_edge=\(analyzerMaxEdge)px"))")
+            lines.append("    jpeg_quality: \(analyzerJPEGQuality)")
+
+            if scenes.isEmpty {
+                lines.append("    visual_logs: []")
+            } else {
+                lines.append("    visual_logs:")
+                for scene in scenes {
+                    let globalSceneStart = globalOffset + max(scene.startSeconds, 0)
+                    lines.append("    - timestamp: \(srtTimestamp(seconds: globalSceneStart))")
+                    lines.append("      local_start_time: \(decimal(max(scene.startSeconds, 0)))")
+                    lines.append("      global_start_time: \(decimal(globalSceneStart))")
+                    lines.append("      description: |-")
+                    lines.append(contentsOf: blockLines(scene.caption.trimmingCharacters(in: .whitespacesAndNewlines), indent: "        "))
+                }
+            }
+
+            globalOffset += duration
+        }
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private static func blockLines(_ text: String, indent: String) -> [String] {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: " | ", with: "\n")
+        return normalized
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line in
+                let content = String(line)
+                return content.isEmpty ? indent : indent + content
+            }
+    }
+
+    private static func yamlKey(_ value: String) -> String {
+        if value.range(of: #"^[A-Za-z0-9._/-]+$"#, options: .regularExpression) != nil {
+            return value
+        }
+        return yamlString(value)
+    }
+
+    private static func yamlString(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
+    private static func decimal(_ value: Double) -> String {
+        if value.isNaN || !value.isFinite { return "0.0" }
+        let rounded = (value * 1000).rounded() / 1000
+        if rounded == floor(rounded) {
+            return String(format: "%.1f", rounded)
+        }
+        if rounded * 10 == floor(rounded * 10) {
+            return String(format: "%.1f", rounded)
+        }
+        if rounded * 100 == floor(rounded * 100) {
+            return String(format: "%.2f", rounded)
+        }
+        return String(format: "%.3f", rounded)
+    }
+
+    private static func srtTimestamp(seconds: Double) -> String {
+        let totalMilliseconds = max(Int((seconds * 1000).rounded()), 0)
+        let hours = totalMilliseconds / 3_600_000
+        let minutes = (totalMilliseconds % 3_600_000) / 60_000
+        let secs = (totalMilliseconds % 60_000) / 1000
+        let milliseconds = totalMilliseconds % 1000
+        return String(format: "%02d:%02d:%02d,%03d", hours, minutes, secs, milliseconds)
+    }
+}
+
 enum ClipDescriptionBuilder {
+    private struct ExternalVisualLog: Decodable {
+        let timestamp: String?
+        let description: String?
+    }
+
     private struct ExternalScene: Decodable {
         let index: Int?
         let start_sec: Double?
@@ -2440,18 +2774,31 @@ enum ClipDescriptionBuilder {
     }
 
     private struct ExternalResult: Decodable {
+        let input_path: String?
+        let global_start_time: Double?
+        let duration: Double?
         let description: String?
         let engine: String?
         let scene_count: Int?
         let scenes: [ExternalScene]?
         let warnings: [String]?
+        let frames_analyzed: Int?
+        let frame_resolution: String?
+        let jpeg_quality: Int?
+        let visual_logs: [ExternalVisualLog]?
         let error: String?
     }
 
+    private struct ExternalBatchResult: Decodable {
+        let clips: [String: ExternalResult]?
+        let error: String?
+        let warnings: [String]?
+    }
+
     private struct ExternalRun {
-        let python: String
+        let launcher: String
         let scriptPath: String
-        let inputPath: String
+        let inputPaths: [String]
         let maxWords: Int
         let lang: String
         let segmentSeconds: Double
@@ -2459,6 +2806,7 @@ enum ClipDescriptionBuilder {
         let stdout: String
         let stderr: String
         let decoded: ExternalResult?
+        let decodedBatch: ExternalBatchResult?
     }
 
     struct DescribeResult {
@@ -2473,6 +2821,42 @@ enum ClipDescriptionBuilder {
         let tags: [String]
         let activity: String
         let palette: String
+    }
+
+    private static func decodeJSONPayload<T: Decodable>(_ type: T.Type, from data: Data) -> T? {
+        if let decoded = try? JSONDecoder().decode(T.self, from: data) {
+            return decoded
+        }
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let candidates: [Character] = ["{", "["]
+        var bestRange: Range<String.Index>?
+        for marker in candidates {
+            guard let start = trimmed.firstIndex(of: marker) else { continue }
+            let candidate = trimmed[start...]
+            if let _ = try? JSONSerialization.jsonObject(with: Data(candidate.utf8)) {
+                bestRange = start..<trimmed.endIndex
+                break
+            }
+        }
+
+        guard let range = bestRange else { return nil }
+        return try? JSONDecoder().decode(T.self, from: Data(trimmed[range].utf8))
+    }
+
+    private static func externalDebugLines(for run: ExternalRun) -> [String] {
+        var debugLines: [String] = []
+        debugLines.append("Analyzer cmd: \(run.launcher) \(run.scriptPath) --input \(run.inputPaths.joined(separator: " ")) --max-words \(run.maxWords) --lang \(run.lang) --segment-sec \(String(format: "%.3f", run.segmentSeconds))")
+        debugLines.append("Analyzer exitCode: \(run.exitCode)")
+        if !run.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            debugLines.append("Analyzer stderr:\n\(run.stderr)")
+        }
+        if !run.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            debugLines.append("Analyzer stdout:\n\(run.stdout)")
+        }
+        return debugLines
     }
 
     enum EngineId: String, CaseIterable, Identifiable {
@@ -2492,15 +2876,18 @@ enum ClipDescriptionBuilder {
         engine: EngineId
     ) async throws -> DescribeResult {
         let maxWords = min(max(maxWords, 60), 300)
+        var fallbackDebugLines: [String] = []
         if let run = await externalDescription(url: url, maxWords: maxWords, pythonExec: pythonExec, language: language, segmentSeconds: segmentSeconds, engine: engine) {
-            var debugLines: [String] = []
-            debugLines.append("Analyzer cmd: \(run.python) \(run.scriptPath) --input \(run.inputPath) --max-words \(run.maxWords) --lang \(run.lang) --segment-sec \(String(format: "%.3f", run.segmentSeconds))")
-            debugLines.append("Analyzer exitCode: \(run.exitCode)")
-            if !run.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                debugLines.append("Analyzer stderr:\n\(run.stderr)")
-            }
-            if !run.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                debugLines.append("Analyzer stdout:\n\(run.stdout)")
+            let debugLines = externalDebugLines(for: run)
+            fallbackDebugLines = debugLines
+
+            if let item = run.decodedBatch?.clips?[url.lastPathComponent] {
+                switch decodeExternalResult(item, debugLines: debugLines) {
+                case .success(let result):
+                    return result
+                case .failure:
+                    break
+                }
             }
 
             if let description = run.decoded?.description, !description.isEmpty {
@@ -2531,7 +2918,7 @@ enum ClipDescriptionBuilder {
                 engine: "on_device_vision",
                 warnings: [],
                 scenes: [],
-                debugLines: []
+                debugLines: fallbackDebugLines
             )
         }
 
@@ -2558,8 +2945,45 @@ enum ClipDescriptionBuilder {
             engine: "on_device_vision",
             warnings: [],
             scenes: [],
-            debugLines: []
+            debugLines: fallbackDebugLines
         )
+    }
+
+    static func describeAll(
+        urls: [URL],
+        pythonExec: String,
+        maxWords: Int,
+        language: DescriptionLanguage,
+        segmentSeconds: Double,
+        engine: EngineId
+    ) async -> [(URL, Result<DescribeResult, Error>)] {
+        let maxWords = min(max(maxWords, 60), 300)
+        guard !urls.isEmpty else { return [] }
+        guard let run = await externalDescription(urls: urls, maxWords: maxWords, pythonExec: pythonExec, language: language, segmentSeconds: segmentSeconds, engine: engine) else {
+            return await fallbackDescribeAll(urls: urls, pythonExec: pythonExec, maxWords: maxWords, language: language, segmentSeconds: segmentSeconds, engine: engine)
+        }
+
+        let debugLines = externalDebugLines(for: run)
+
+        if let clips = run.decodedBatch?.clips, !clips.isEmpty {
+            return urls.map { url in
+                if let item = clips[url.lastPathComponent] {
+                    return (url, decodeExternalResult(item, debugLines: debugLines))
+                }
+                return (url, .failure(VideoMergeError.exportFailed("No description result returned for \(url.lastPathComponent)")))
+            }
+        }
+
+        if let single = run.decoded {
+            return urls.map { url in
+                if url.path == single.input_path || urls.count == 1 {
+                    return (url, decodeExternalResult(single, debugLines: debugLines))
+                }
+                return (url, .failure(VideoMergeError.exportFailed("No description result returned for \(url.lastPathComponent)")))
+            }
+        }
+
+        return await fallbackDescribeAll(urls: urls, pythonExec: pythonExec, maxWords: maxWords, language: language, segmentSeconds: segmentSeconds, engine: engine)
     }
 
     private static func externalDescription(
@@ -2570,20 +2994,43 @@ enum ClipDescriptionBuilder {
         segmentSeconds: Double,
         engine: EngineId
     ) async -> ExternalRun? {
+        await externalDescription(urls: [url], maxWords: maxWords, pythonExec: pythonExec, language: language, segmentSeconds: segmentSeconds, engine: engine)
+    }
+
+    private static func externalDescription(
+        urls: [URL],
+        maxWords: Int,
+        pythonExec: String,
+        language: DescriptionLanguage,
+        segmentSeconds: Double,
+        engine: EngineId
+    ) async -> ExternalRun? {
         guard let scriptURL = resolveAnalyzerScriptURL() else { return nil }
 
         return await Task.detached(priority: .userInitiated) {
-            let python = pythonExec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "python3" : pythonExec
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            var args: [String] = [
-                python,
-                scriptURL.path,
-                "--input", url.path,
+            let isShellLauncher = scriptURL.pathExtension == "sh"
+            if isShellLauncher {
+                process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            }
+            var args: [String] = isShellLauncher ? [
+                scriptURL.path
+            ] : [
+                pythonExec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "python3" : pythonExec,
+                scriptURL.path
+            ]
+            if scriptURL.lastPathComponent == "run.sh" || scriptURL.lastPathComponent == "descriptiongen_run.sh" || scriptURL.lastPathComponent == "descriptiongen_process_vlog.py" || scriptURL.path.contains("/tools/descriptiongen/") {
+                args.append("--json-output")
+            }
+            args.append("--input")
+            args.append(contentsOf: urls.map(\.path))
+            args.append(contentsOf: [
                 "--max-words", String(maxWords),
                 "--lang", language.analyzerArg,
                 "--segment-sec", String(format: "%.3f", segmentSeconds)
-            ]
+            ])
             switch engine {
             case .auto:
                 break
@@ -2599,45 +3046,177 @@ enum ClipDescriptionBuilder {
             process.standardOutput = outPipe
             process.standardError = errPipe
 
+            let ioLock = NSLock()
+            var outData = Data()
+            var errData = Data()
+
+            func appendChunk(_ data: Data, to target: inout Data, label: String) {
+                guard !data.isEmpty else { return }
+                target.append(data)
+                if let text = String(data: data, encoding: .utf8) {
+                    let trimmed = text.trimmingCharacters(in: .newlines)
+                    if !trimmed.isEmpty {
+                        AppLog.log("\(label): \(trimmed)")
+                    }
+                }
+            }
+
+            outPipe.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                guard !chunk.isEmpty else { return }
+                ioLock.lock()
+                appendChunk(chunk, to: &outData, label: "Analyzer stdout")
+                ioLock.unlock()
+            }
+
+            errPipe.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                guard !chunk.isEmpty else { return }
+                ioLock.lock()
+                appendChunk(chunk, to: &errData, label: "Analyzer stderr")
+                ioLock.unlock()
+            }
+
+            AppLog.log("Analyzer started: \(isShellLauncher ? "/bin/bash" : (pythonExec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "python3" : pythonExec)) \(args.joined(separator: " "))")
+
             do {
                 try process.run()
                 process.waitUntilExit()
             } catch {
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                errPipe.fileHandleForReading.readabilityHandler = nil
                 return nil
             }
 
-            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            outPipe.fileHandleForReading.readabilityHandler = nil
+            errPipe.fileHandleForReading.readabilityHandler = nil
+
+            let remainingOut = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let remainingErr = errPipe.fileHandleForReading.readDataToEndOfFile()
+            ioLock.lock()
+            outData.append(remainingOut)
+            errData.append(remainingErr)
+            ioLock.unlock()
+
             let stdout = String(data: outData, encoding: .utf8) ?? ""
             let stderr = String(data: errData, encoding: .utf8) ?? ""
-            let decoded = try? JSONDecoder().decode(ExternalResult.self, from: outData)
+            let decoded = decodeJSONPayload(ExternalResult.self, from: outData)
+            let decodedBatch = decodeJSONPayload(ExternalBatchResult.self, from: outData)
             return ExternalRun(
-                python: python,
+                launcher: isShellLauncher ? "/bin/bash" : (pythonExec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "python3" : pythonExec),
                 scriptPath: scriptURL.path,
-                inputPath: url.path,
+                inputPaths: urls.map(\.path),
                 maxWords: maxWords,
                 lang: language.analyzerArg,
                 segmentSeconds: segmentSeconds,
                 exitCode: process.terminationStatus,
                 stdout: stdout,
                 stderr: stderr,
-                decoded: decoded
+                decoded: decoded,
+                decodedBatch: decodedBatch
             )
         }.value
     }
 
     private static func resolveAnalyzerScriptURL() -> URL? {
-        if let bundled = Bundle.main.url(forResource: "video_understanding", withExtension: "py") {
+        if let bundled = Bundle.main.url(forResource: "descriptiongen_run", withExtension: "sh") {
             return bundled
         }
 
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("scripts/video_understanding.py")
-        if FileManager.default.fileExists(atPath: cwd.path) {
-            return cwd
+        let descriptiongen = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("tools/descriptiongen/run.sh")
+        if FileManager.default.fileExists(atPath: descriptiongen.path) {
+            return descriptiongen
         }
 
         return nil
+    }
+
+    static func analyzerScriptURL() -> URL? {
+        resolveAnalyzerScriptURL()
+    }
+
+    private static func decodeExternalResult(_ item: ExternalResult, debugLines: [String]) -> Result<DescribeResult, Error> {
+        let derivedScenes: [ClipSceneCaption] = (item.visual_logs ?? []).enumerated().compactMap { offset, log in
+            let caption = (log.description ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !caption.isEmpty else { return nil }
+            let start = Double(offset)
+            let end = start + 1.0
+            return ClipSceneCaption(index: offset, startSeconds: start, endSeconds: end, caption: caption)
+        }
+        let scenesFromStructured: [ClipSceneCaption] = (item.scenes ?? []).compactMap { scene in
+            guard let start = scene.start_sec, let end = scene.end_sec else { return nil }
+            let idx = scene.index ?? 0
+            let caption = (scene.caption ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return ClipSceneCaption(index: idx, startSeconds: start, endSeconds: end, caption: caption)
+        }
+        .sorted { $0.index < $1.index }
+        let scenes = scenesFromStructured.isEmpty ? derivedScenes : scenesFromStructured
+
+        if let description = item.description, !description.isEmpty {
+            return .success(
+                DescribeResult(
+                    description: description,
+                    engine: item.engine ?? "external_python",
+                    warnings: item.warnings ?? [],
+                    scenes: scenes,
+                    debugLines: debugLines
+                )
+            )
+        }
+
+        if !scenes.isEmpty {
+            return .success(
+                DescribeResult(
+                    description: derivedDescription(from: scenes),
+                    engine: item.engine ?? "external_python",
+                    warnings: item.warnings ?? [],
+                    scenes: scenes,
+                    debugLines: debugLines
+                )
+            )
+        }
+
+        let message = item.error ?? (item.warnings?.first ?? "Description generation failed.")
+        return .failure(VideoMergeError.exportFailed(message))
+    }
+
+    private static func fallbackDescribeAll(
+        urls: [URL],
+        pythonExec: String,
+        maxWords: Int,
+        language: DescriptionLanguage,
+        segmentSeconds: Double,
+        engine: EngineId
+    ) async -> [(URL, Result<DescribeResult, Error>)] {
+        var output: [(URL, Result<DescribeResult, Error>)] = []
+        for url in urls {
+            do {
+                let result = try await describe(
+                    url: url,
+                    pythonExec: pythonExec,
+                    maxWords: maxWords,
+                    language: language,
+                    segmentSeconds: segmentSeconds,
+                    engine: engine
+                )
+                output.append((url, .success(result)))
+            } catch {
+                output.append((url, .failure(error)))
+            }
+        }
+        return output
+    }
+
+    private static func derivedDescription(from scenes: [ClipSceneCaption]) -> String {
+        let captions = scenes
+            .map { $0.caption.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !captions.isEmpty else { return "" }
+
+        let preview = captions.prefix(4)
+        return preview.joined(separator: "\n\n")
     }
 
     private static func codecName(for track: AVAssetTrack) async throws -> String {
@@ -2831,6 +3410,7 @@ enum ClipDescriptionBuilder {
 struct ContentView: View {
     @StateObject private var vm = VideoMergeViewModel()
     @State private var isShowingPreview = false
+    @State private var expandedDescriptionURLs: Set<URL> = []
 
     var body: some View {
         VStack(spacing: 16) {
@@ -2980,8 +3560,15 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
-                    Button(action: vm.generateDescriptionsForAll) {
+                    Button(action: { vm.generateDescriptionsForAll() }) {
                         Label(vm.isGeneratingDescriptions ? "Generating..." : "Generate Descriptions", systemImage: "text.bubble")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(vm.selectedURLs.isEmpty || vm.isGeneratingDescriptions || vm.isExporting)
+
+                    Button(action: vm.regenerateDescriptionsForAll) {
+                        Label(vm.isGeneratingDescriptions ? "Generating..." : "Regenerate Descriptions", systemImage: "arrow.clockwise")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -3075,6 +3662,19 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
 
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Analyzer output folder")
+                        .font(.custom("Avenir Next Demi Bold", size: 11))
+                        .foregroundStyle(.secondary)
+                    Text(vm.analyzerOutputDirectoryPath)
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Open Output Folder", action: vm.openAnalyzerOutputFolder)
+                        .buttonStyle(.bordered)
+                }
+
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("Description length")
@@ -3129,6 +3729,19 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(vm.isExporting || vm.isGeneratingDescriptions)
+
+                HStack(spacing: 8) {
+                    Button(action: vm.enableGPUMemoryBoost) {
+                        Label("Enable GPU Boost", systemImage: "lock.open")
+                            .frame(maxWidth: .infinity)
+                    }
+                    Button(action: vm.resetGPUMemoryBoost) {
+                        Label("Reset GPU Boost", systemImage: "lock.rotation")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(vm.isExporting || vm.isGeneratingDescriptions || vm.isConfiguringGPULimit)
             }
             .font(.custom("Avenir Next Regular", size: 13))
 
@@ -3249,18 +3862,39 @@ struct ContentView: View {
 
                                         keyframesView(for: url)
 
-                                        if let description = vm.clipDescriptions[url] {
-                                            Text(description)
-                                                .font(.custom("Avenir Next Regular", size: 12))
-                                                .foregroundStyle(.secondary)
-                                                .fixedSize(horizontal: false, vertical: true)
-                                                .textSelection(.enabled)
-                                            if let timed = vm.timestampedDescription(for: url) {
-                                                Text(timed)
-                                                    .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                                    .foregroundStyle(.secondary)
-                                                    .fixedSize(horizontal: false, vertical: true)
-                                                    .textSelection(.enabled)
+                                        if let timed = vm.timestampedDescription(for: url) {
+                                            let isExpanded = expandedDescriptionURLs.contains(url)
+                                            VStack(alignment: .leading, spacing: 8) {
+                                                VStack(alignment: .leading, spacing: 5) {
+                                                    Text("Scene Notes")
+                                                        .font(.custom("Avenir Next Demi Bold", size: 11))
+                                                        .foregroundStyle(.primary)
+
+                                                    Text(timed)
+                                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                                        .foregroundStyle(.secondary)
+                                                        .lineSpacing(3)
+                                                        .multilineTextAlignment(.leading)
+                                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                                        .lineLimit(isExpanded ? nil : 10)
+                                                        .fixedSize(horizontal: false, vertical: true)
+                                                        .textSelection(.enabled)
+                                                }
+                                                .padding(10)
+                                                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                                Button(action: {
+                                                    if isExpanded {
+                                                        expandedDescriptionURLs.remove(url)
+                                                    } else {
+                                                        expandedDescriptionURLs.insert(url)
+                                                    }
+                                                }) {
+                                                    Text(isExpanded ? "Show Less" : "Show More")
+                                                        .font(.custom("Avenir Next Demi Bold", size: 11))
+                                                }
+                                                .buttonStyle(.plain)
+                                                .foregroundStyle(.tint)
                                             }
                                             if let engine = vm.clipEngines[url] {
                                                 Text("Engine: \(engine)")
@@ -3277,7 +3911,7 @@ struct ContentView: View {
                                                     .textSelection(.enabled)
                                             }
                                         } else {
-                                            Text("No clip description yet. Generate one to draft a subtitle automatically.")
+                                            Text("No scene notes yet. Generate descriptions to analyze this clip.")
                                                 .font(.custom("Avenir Next Regular", size: 12))
                                                 .foregroundStyle(.secondary)
                                                 .fixedSize(horizontal: false, vertical: true)
@@ -3468,49 +4102,87 @@ struct ContentView: View {
     }
 
     private var footerView: some View {
-        HStack(spacing: 12) {
-            Label(vm.statusMessage, systemImage: (vm.isExporting || vm.isGeneratingDescriptions) ? "clock.arrow.circlepath" : "checkmark.seal")
-                .font(.custom("Avenir Next Regular", size: 13))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Label(vm.statusMessage, systemImage: (vm.isExporting || vm.isGeneratingDescriptions) ? "clock.arrow.circlepath" : "checkmark.seal")
+                    .font(.custom("Avenir Next Regular", size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
 
-            Spacer()
+                Spacer()
 
-            Button(action: { isShowingPreview = true }) {
-                HStack(spacing: 8) {
-                    Image(systemName: "play.circle")
-                    Text("Preview")
-                        .font(.custom("Avenir Next Demi Bold", size: 14))
-                }
-                .frame(minWidth: 140)
-            }
-            .buttonStyle(.bordered)
-            .disabled(vm.selectedURLs.isEmpty || vm.isExporting || vm.isGeneratingDescriptions)
-
-            Button(action: vm.exportMergedVideo) {
-                HStack(spacing: 8) {
-                    if vm.isExporting {
-                        ProgressView()
-                            .scaleEffect(0.7)
+                Button(action: { isShowingPreview = true }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "play.circle")
+                        Text("Preview")
+                            .font(.custom("Avenir Next Demi Bold", size: 14))
                     }
-                    Text(vm.isExporting ? "Exporting..." : "Export Vlog Package")
-                        .font(.custom("Avenir Next Demi Bold", size: 14))
+                    .frame(minWidth: 140)
                 }
-                .frame(minWidth: 220)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(vm.selectedURLs.isEmpty || vm.isExporting || vm.isGeneratingDescriptions)
+                .buttonStyle(.bordered)
+                .disabled(vm.selectedURLs.isEmpty || vm.isExporting || vm.isGeneratingDescriptions)
 
-            Button(action: vm.exportProxyVideoForAI) {
-                HStack(spacing: 8) {
-                    Image(systemName: "paperplane")
-                    Text("Export Proxy")
-                        .font(.custom("Avenir Next Demi Bold", size: 14))
+                Button(action: vm.exportMergedVideo) {
+                    HStack(spacing: 8) {
+                        if vm.isExporting {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                        }
+                        Text(vm.isExporting ? "Exporting..." : "Export Vlog Package")
+                            .font(.custom("Avenir Next Demi Bold", size: 14))
+                    }
+                    .frame(minWidth: 220)
                 }
-                .frame(minWidth: 160)
+                .buttonStyle(.borderedProminent)
+                .disabled(vm.selectedURLs.isEmpty || vm.isExporting || vm.isGeneratingDescriptions)
+
+                Button(action: vm.exportProxyVideoForAI) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "paperplane")
+                        Text("Export Proxy")
+                            .font(.custom("Avenir Next Demi Bold", size: 14))
+                    }
+                    .frame(minWidth: 160)
+                }
+                .buttonStyle(.bordered)
+                .disabled(vm.selectedURLs.isEmpty || vm.isExporting || vm.isGeneratingDescriptions)
             }
-            .buttonStyle(.bordered)
-            .disabled(vm.selectedURLs.isEmpty || vm.isExporting || vm.isGeneratingDescriptions)
+
+            if vm.isGeneratingDescriptions || vm.isConfiguringGPULimit || !vm.recentDebugLines.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let detail = vm.statusDetail, !detail.isEmpty {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(detail)
+                                .font(.custom("Avenir Next Regular", size: 12))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    if !vm.recentDebugLines.isEmpty {
+                        Text(vm.isGeneratingDescriptions || vm.isConfiguringGPULimit ? "Live Analyzer Output" : "Recent Analyzer Output")
+                            .font(.custom("Avenir Next Demi Bold", size: 11))
+                            .foregroundStyle(.secondary)
+                        ScrollView(.vertical) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(Array(vm.recentDebugLines.enumerated()), id: \.offset) { _, line in
+                                    Text(line)
+                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 112)
+                        .padding(10)
+                        .background(Color.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                }
+            }
         }
         .padding(14)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
