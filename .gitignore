@@ -4,3 +4,5 @@ tools/descriptiongen/output
 .build/
 .venv/
 dist/
+__pycache__/
+*.pyc

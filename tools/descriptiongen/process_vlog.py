@@ -8,9 +8,11 @@ import shutil
 import subprocess
 import sys
 import time
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+import yaml
 
 # ─────────────────────────────────────────────
 #  CONFIG — tweak these to taste
@@ -59,7 +61,43 @@ FRAME_PROMPT = (
 # Script start time — used as output filename
 RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 ORIGINAL_STDOUT = sys.stdout
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+def resolve_output_dir() -> Path:
+    override = os.environ.get("VCAT_OUTPUT_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parent / "output"
+
+
+OUTPUT_DIR = resolve_output_dir()
+
+
+class LiteralStr(str):
+    pass
+
+
+def literal_representer(dumper, data):
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+yaml.add_representer(LiteralStr, literal_representer)
+
+
+def wrap_descriptions(obj):
+    if isinstance(obj, dict):
+        return {
+            k: LiteralStr(v) if k == "description" and isinstance(v, str) else wrap_descriptions(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [wrap_descriptions(i) for i in obj]
+    return obj
+
+
+def dump_yaml(path: Path, data: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(wrap_descriptions(data), f, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
 
 def get_now() -> str:
@@ -151,7 +189,8 @@ def extract_frames_at_1fps(
     video_path: Path,
     max_edge: int = MAX_EDGE,
     jpeg_quality: int = JPEG_Q,
-) -> tuple[list[str], float]:
+    duration_override: float | None = None,
+) -> tuple[list[tuple[str, float]], float]:
     cv2 = _cv2()
     clip_tmp = os.path.join(FRAME_TMP, video_path.stem)
     os.makedirs(clip_tmp, exist_ok=True)
@@ -164,26 +203,28 @@ def extract_frames_at_1fps(
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
     duration    = frame_count / fps if fps > 0 else 0.0
 
-    frame_paths = []
-    for second in range(int(duration)):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(second * fps))
+    frame_entries: list[tuple[str, float]] = []
+    extract_seconds = duration_override if duration_override and duration_override > 0 else duration
+    for i in range(int(extract_seconds)):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(i * fps)))
         ret, frame = cap.read()
         if not ret:
             break
         frame    = resize_frame(frame, max_edge)
-        tmp_path = os.path.join(clip_tmp, f"s{second:04d}.jpg")
+        tmp_path = os.path.join(clip_tmp, f"s{i:04d}.jpg")
         cv2.imwrite(tmp_path, frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
-        frame_paths.append(tmp_path)
+        timestamp_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        frame_entries.append((tmp_path, timestamp_sec))
 
     cap.release()
-    return frame_paths, duration
+    return frame_entries, duration
 
 
-def cleanup_frames(frame_paths: list[str]):
+def cleanup_frames(frame_paths: list[tuple[str, float]]):
     if not frame_paths:
         return
     try:
-        shutil.rmtree(os.path.dirname(frame_paths[0]))
+        shutil.rmtree(os.path.dirname(frame_paths[0][0]))
     except OSError:
         pass
 
@@ -203,33 +244,10 @@ def collect_clips(inputs: list[str]) -> list[Path]:
 
 
 def save_log(log_file: Path, data: dict) -> float:
-    """Save YAML log. Returns time taken in seconds."""
-    import yaml
-
-    # Use literal block scalar (|) for multiline strings so descriptions render
-    # as clean readable blocks instead of single-quoted escaped strings
-    class LiteralStr(str): pass
-
-    def literal_representer(dumper, data):
-        if "\n" in data:
-            return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
-        return dumper.represent_scalar("tag:yaml.org,2002:str", data)
-
-    yaml.add_representer(LiteralStr, literal_representer)
-
-    def wrap_descriptions(obj):
-        if isinstance(obj, dict):
-            return {k: LiteralStr(v) if k == "description" and isinstance(v, str) else wrap_descriptions(v)
-                    for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [wrap_descriptions(i) for i in obj]
-        return obj
-
     print(f"[{get_now()}] 💾 Saving log → {log_file} ({len(data.get('clips', data))} clip(s))...")
     t0 = time.time()
     try:
-        with open(log_file, "w", encoding="utf-8") as f:
-            yaml.dump(wrap_descriptions(data), f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        dump_yaml(log_file, data)
         elapsed = time.time() - t0
         size_kb = log_file.stat().st_size / 1024
         print(f"[{get_now()}] ✅ Log saved ({size_kb:.1f} KB, {elapsed*1000:.0f}ms)")
@@ -237,6 +255,47 @@ def save_log(log_file: Path, data: dict) -> float:
     except Exception as e:
         print(f"[{get_now()}] ❌ FAILED to save log: {e}")
         return 0.0
+
+
+def write_per_clip_yaml(output_dir: Path, clip_name: str, record: dict):
+    per_clip_dir = output_dir / "per_clip"
+    per_clip_dir.mkdir(parents=True, exist_ok=True)
+    sanitized = re.sub(r"[^\w\-\.]+", "_", clip_name)
+    filename = per_clip_dir / f"{sanitized}.yaml"
+    clip_start = record.get("global_start_time", 0.0)
+    filtered_record = remove_global_times(record, clip_start)
+    dump_yaml(filename, {"clip": filtered_record})
+
+
+def remove_global_times(record: dict, clip_start: float) -> dict:
+    pruned = {}
+    for key, value in record.items():
+        if key == "global_start_time":
+            continue
+        if key == "visual_logs" and isinstance(value, list):
+            pruned[key] = [remove_entry_global_times(entry, clip_start) for entry in value]
+            continue
+        pruned[key] = value
+    return pruned
+
+
+def remove_entry_global_times(entry: dict, clip_start: float) -> dict:
+    seconds = entry.get("in_clip_start_time")
+    fallback = entry.get("timestamp_seconds")
+    if seconds is None and fallback is not None:
+        try:
+            seconds = float(fallback) - clip_start
+        except (TypeError, ValueError):
+            seconds = 0.0
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    seconds = max(seconds, 0.0)
+    thinned = {k: v for k, v in entry.items() if k not in {"global_start_time"}}
+    thinned["timestamp"] = to_srt_timestamp(seconds)
+    thinned["timestamp_seconds"] = round(seconds, 3)
+    return thinned
 
 
 def output_log_path() -> Path:
@@ -282,35 +341,79 @@ def yaml_clips_from_app_results(results: list[dict], max_edge: int, jpeg_quality
         if not input_path:
             continue
         clip_path = Path(input_path)
+        clip_duration = ffprobe_duration(clip_path)
         scenes = item.get("scenes") or []
+        raw_visual_logs = item.get("visual_logs") or []
         duration = 0.0
         visual_logs = []
-        for scene in scenes:
-            start_sec = float(scene.get("start_sec") or 0.0)
-            end_sec = float(scene.get("end_sec") or start_sec)
-            duration = max(duration, end_sec)
-            visual_logs.append(
-                {
-                    "timestamp": to_srt_timestamp(global_offset + start_sec),
-                    "description": scene.get("caption", "") or "",
-                }
-            )
+        if raw_visual_logs:
+            for entry in raw_visual_logs:
+                local_start = entry.get("in_clip_start_time")
+                if local_start is None and entry.get("timestamp_seconds") is not None:
+                    try:
+                        local_start = float(entry.get("timestamp_seconds"))
+                    except (TypeError, ValueError):
+                        local_start = 0.0
+                try:
+                    local_start = float(local_start or 0.0)
+                except (TypeError, ValueError):
+                    local_start = 0.0
+                duration = max(duration, local_start)
+                visual_logs.append(entry)
+        else:
+            for scene in scenes:
+                start_sec = float(scene.get("start_sec") or 0.0)
+                end_sec = float(scene.get("end_sec") or start_sec)
+                duration = max(duration, end_sec)
+                visual_logs.append(
+                    {
+                        "timestamp": to_srt_timestamp(global_offset + start_sec),
+                        "timestamp_seconds": round(global_offset + start_sec, 3),
+                        "in_clip_start_time": round(start_sec, 3),
+                        "description": scene.get("caption", "") or "",
+                    }
+                )
+
+        effective_duration = max(clip_duration, duration)
+        finalized_logs = [finalize_visual_log(entry, global_offset) for entry in visual_logs]
 
         clips[clip_path.name] = build_clip_record(
             clip_path=str(clip_path),
             global_start_time=global_offset,
-            duration=duration,
+            duration=effective_duration,
             frames_analyzed=len(scenes),
             max_edge=max_edge,
             jpeg_quality=jpeg_quality,
-            visual_logs=visual_logs,
+            visual_logs=finalized_logs,
             engine=item.get("engine", "mlx_vlm_qwen2_vl") or "mlx_vlm_qwen2_vl",
             warnings=item.get("warnings") or [],
             error=item.get("error"),
         )
-        global_offset += duration
+        global_offset += effective_duration
 
     return {"clips": clips}
+
+
+def finalize_visual_log(entry: dict, global_offset: float) -> dict:
+    log = dict(entry)
+    local_start = log.get("in_clip_start_time")
+    if local_start is None and log.get("timestamp_seconds") is not None:
+        try:
+            local_start = float(log.get("timestamp_seconds"))
+        except (TypeError, ValueError):
+            local_start = 0.0
+    try:
+        local_start = float(local_start or 0.0)
+    except (TypeError, ValueError):
+        local_start = 0.0
+    local_start = max(local_start, 0.0)
+
+    global_start = global_offset + local_start
+    log["in_clip_start_time"] = round(local_start, 3)
+    log["global_start_time"] = round(global_start, 3)
+    log["timestamp_seconds"] = round(global_start, 3)
+    log["timestamp"] = to_srt_timestamp(global_start)
+    return log
 
 
 def ffprobe_duration(video_path: Path) -> float:
@@ -403,9 +506,9 @@ def analyze_clip_for_app(
 
     visual_logs: list[dict] = []
     try:
-        for i, frame_path in enumerate(frames):
+        for i, (frame_path, frame_timestamp) in enumerate(frames):
             formatted_prompt = apply_chat_template(processor, config, FRAME_PROMPT, num_images=1)
-            print(f"[{get_now()}] 🤖 Frame {i + 1}/{len(frames)}: {frame_path}")
+            print(f"[{get_now()}] 🤖 Frame {i + 1}/{len(frames)}: {frame_path} @ {frame_timestamp:.3f}s")
             frame_res = generate(
                 model,
                 processor,
@@ -433,7 +536,9 @@ def analyze_clip_for_app(
             cleaned = "\n".join(line for line in cleaned_lines if line).strip()
             visual_logs.append(
                 {
-                    "timestamp": to_srt_timestamp(float(i)),
+                    "timestamp": to_srt_timestamp(frame_timestamp),
+                    "timestamp_seconds": frame_timestamp,
+                    "in_clip_start_time": round(frame_timestamp, 3),
                     "description": cleaned,
                 }
             )
@@ -446,7 +551,7 @@ def analyze_clip_for_app(
         caption = entry["description"]
         if not caption:
             continue
-        start = float(index)
+        start = float(entry.get("timestamp_seconds") or index)
         end = start + 1.0
         scenes.append(
             {
@@ -464,6 +569,7 @@ def analyze_clip_for_app(
         "engine": "mlx_vlm_qwen2_vl",
         "scene_count": len(scenes),
         "scenes": scenes,
+        "visual_logs": visual_logs,
         "warnings": [],
     }
 
@@ -497,7 +603,8 @@ def run():
     parser.add_argument("--max-edge",      type=int,  default=MAX_EDGE)
     parser.add_argument("--jpeg-quality",  type=int,  default=JPEG_Q)
     parser.add_argument("--max-tokens",    type=int,  default=MAX_TOKENS)
-    parser.add_argument("--no-cleanup",    action="store_true")
+    parser.add_argument("--cleanup",       action="store_true",
+                        help="Remove extracted frames when the run finishes.")
     parser.add_argument("--max-words",     type=int,  default=120)
     parser.add_argument("--lang",          default="en")
     parser.add_argument("--segment-sec",   type=float, default=1.0)
@@ -549,9 +656,12 @@ def run():
                             "scenes": [],
                         }
                     )
-            log_file = output_log_path()
-            save_log(log_file, yaml_clips_from_app_results(results, args.max_edge, args.jpeg_quality))
             payload = yaml_clips_from_app_results(results, args.max_edge, args.jpeg_quality)
+            log_file = output_log_path()
+            save_log(log_file, payload)
+            output_dir = log_file.parent
+            for clip_name, record in payload.get("clips", {}).items():
+                write_per_clip_yaml(output_dir, clip_name, record)
         except Exception as exc:
             payload = {
                 "error": str(exc),
@@ -605,34 +715,36 @@ def run():
         # ── Extract frames ────────────────────────────────────────────────────
         print(f"[{get_now()}] 🖼️  Extracting frames from {vid.name}...")
         t0 = time.time()
+        clip_duration = ffprobe_duration(vid)
         frames, duration = extract_frames_at_1fps(
             vid,
             max_edge=args.max_edge,
             jpeg_quality=args.jpeg_quality,
+            duration_override=clip_duration,
         )
         clip_stats.t_extraction     = time.time() - t0
-        clip_stats.duration         = duration
+        clip_stats.duration         = clip_duration
         clip_stats.frames_extracted = len(frames)
-        print(f"[{get_now()}] 🖼️  {len(frames)} frames extracted in {clip_stats.t_extraction*1000:.0f}ms | duration={duration:.2f}s")
+        print(f"[{get_now()}] 🖼️  {len(frames)} frames extracted in {clip_stats.t_extraction*1000:.0f}ms | duration={clip_duration:.2f}s")
 
         if frames:
-            print(f"[{get_now()}] 🖼️  First frame : {frames[0]} (exists={Path(frames[0]).exists()})")
-            print(f"[{get_now()}] 🖼️  Last frame  : {frames[-1]}")
+            print(f"[{get_now()}] 🖼️  First frame : {frames[0][0]} (exists={Path(frames[0][0]).exists()})")
+            print(f"[{get_now()}] 🖼️  Last frame  : {frames[-1][0]} (timestamp={frames[-1][1]:.3f}s)")
         else:
             print(f"[{get_now()}] ❌ Could not extract frames from {vid.name} — skipping.")
             run_stats.clips.append(clip_stats)
             continue
 
-        print(f"[{get_now()}] 🎞️  {vid.name} | {int(duration)}s | {len(frames)} frames | ~{args.max_edge}px edge")
+        print(f"[{get_now()}] 🎞️  {vid.name} | {clip_duration:.2f}s | {len(frames)} frames | ~{args.max_edge}px edge")
 
         try:
             visual_logs        = []
             t_understand_start = time.time()
 
-            for i, frame_path in enumerate(frames):
-                second        = i
+            for i, (frame_path, frame_timestamp) in enumerate(frames):
+                second        = frame_timestamp
                 global_second = global_offset + second
-                print(f"[{get_now()}] 🤖 Frame {i+1}/{len(frames)}: clip_t={second}s | global_t={global_second:.2f}s | {frame_path} (exists={Path(frame_path).exists()})")
+                print(f"[{get_now()}] 🤖 Frame {i+1}/{len(frames)}: clip_t={second:.3f}s | global_t={global_second:.3f}s | {frame_path} (exists={Path(frame_path).exists()})")
 
                 formatted_prompt = apply_chat_template(
                     processor, config, FRAME_PROMPT, num_images=1
@@ -691,8 +803,11 @@ def run():
 
                 print(f"[{get_now()}] ✏️  ({t_frame_elapsed:.2f}s) → {text[:100]}{'...' if len(text) > 100 else ''}")
                 visual_logs.append({
-                    "timestamp":   to_srt_timestamp(global_second),
-                    "description": text,
+                    "timestamp":          to_srt_timestamp(global_second),
+                    "in_clip_start_time": round(second, 3),
+                    "global_start_time":  round(global_second, 3),
+                    "timestamp_seconds":  round(global_second, 3),
+                    "description":        text,
                 })
 
             clip_stats.t_understanding  = time.time() - t_understand_start
@@ -702,10 +817,10 @@ def run():
             for entry in visual_logs:
                 print(f"             t={entry['timestamp']} | {entry['description'][:80]}")
 
-            master_results[vid.name] = build_clip_record(
+            record = build_clip_record(
                 clip_path=str(vid),
                 global_start_time=global_offset,
-                duration=duration,
+                duration=clip_duration,
                 frames_analyzed=len(frames),
                 max_edge=args.max_edge,
                 jpeg_quality=args.jpeg_quality,
@@ -713,6 +828,8 @@ def run():
                 engine="mlx_vlm_qwen2_vl",
                 warnings=[],
             )
+            master_results[vid.name] = record
+            write_per_clip_yaml(output_dir, vid.name, record)
 
             clip_stats.t_save    = save_log(log_file, {"clips": master_results})
             clip_stats.succeeded = all(
@@ -725,10 +842,10 @@ def run():
             print(f"\n[{get_now()}] ❌ Clip-level failure on {vid.name}: {e}")
             traceback.print_exc()
             # Record the failed clip in output so it's visible in the YAML
-            master_results[vid.name] = build_clip_record(
+            record = build_clip_record(
                 clip_path=str(vid),
                 global_start_time=global_offset,
-                duration=duration,
+                duration=clip_duration,
                 frames_analyzed=len(visual_logs),
                 max_edge=args.max_edge,
                 jpeg_quality=args.jpeg_quality,
@@ -737,14 +854,16 @@ def run():
                 warnings=[str(e)],
                 error=str(e),
             )
+            master_results[vid.name] = record
+            write_per_clip_yaml(output_dir, vid.name, record)
             save_log(log_file, {"clips": master_results})
 
         finally:
             run_stats.clips.append(clip_stats)
-            if not args.no_cleanup:
-                cleanup_frames(frames)
+        if args.cleanup:
+            cleanup_frames(frames)
 
-        global_offset += duration
+        global_offset += clip_duration
 
     # ── Final summary ─────────────────────────────────────────────────────────
     clips_ok    = sum(1 for s in run_stats.clips if s.succeeded)

@@ -20,6 +20,7 @@ cp "$BUILD_DIR/$EXEC_NAME" "$MACOS_DIR/$EXEC_NAME"
 chmod +x "$MACOS_DIR/$EXEC_NAME"
 cp "$ROOT_DIR/tools/descriptiongen/run.sh" "$RESOURCES_DIR/descriptiongen_run.sh"
 cp "$ROOT_DIR/tools/descriptiongen/process_vlog.py" "$RESOURCES_DIR/process_vlog.py"
+cp "$ROOT_DIR/prompts/final_subtitle" "$RESOURCES_DIR/final_subtitle"
 chmod +x "$RESOURCES_DIR/descriptiongen_run.sh"
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST

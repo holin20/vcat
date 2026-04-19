@@ -553,6 +553,7 @@ final class VideoMergeViewModel: ObservableObject {
     @Published var burnInSubtitles = true
     @Published var exportSRT = true
     @Published var exportScriptDocument = true
+    @Published var combinedDescriptionExported = false
     @Published var subtitleTimingMode: SubtitleTimingMode = .sceneTimed
     @Published var subtitleTone: SubtitleTone = .humorTourGuide {
         didSet {
@@ -565,19 +566,56 @@ final class VideoMergeViewModel: ObservableObject {
     @Published var isExporting = false
     @Published var isGeneratingDescriptions = false
     @Published var isConfiguringGPULimit = false
+    @Published var isRefreshingGPULimit = false
+    @Published var isGeneratingClaudeSubtitle = false
     @Published var statusMessage = "Choose videos and export."
     @Published var statusDetail: String? = nil
     @Published var importedSubtitleEntries: [TimedScriptEntry] = []
     @Published var importedSRTPath: String? = nil
+    @Published var claudeSubtitlePrompt = ""
+    @Published var claudeSubtitleYAML = ""
+    @Published var claudeSubtitleSourceLabel = "Current generated YAML"
+    @Published var configuredGPUMemoryLimitMB: Int = 18000 {
+        didSet {
+            let upper = gpuMemoryLimitSystemUpperBoundMB
+            let clamped = min(max(configuredGPUMemoryLimitMB, 1024), upper)
+            if clamped != configuredGPUMemoryLimitMB {
+                configuredGPUMemoryLimitMB = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: gpuMemoryLimitDefaultsKey)
+        }
+    }
+    @Published var currentGPUMemoryLimitMB: Int? = nil
+    @Published var currentGPUMemoryLimitDetail = "Current limit unavailable until refreshed."
+
+    private var physicalMemoryMB: Int {
+        max(1, Int(ProcessInfo.processInfo.physicalMemory / 1_048_576))
+    }
+
+    private var gpuMemoryLimitSystemUpperBoundMB: Int {
+        let actual = currentGPUMemoryLimitMB ?? 0
+        return max(actual, physicalMemoryMB)
+    }
+
+    var gpuMemoryLimitRangeMB: ClosedRange<Int> {
+        let upper = max(gpuMemoryLimitSystemUpperBoundMB, configuredGPUMemoryLimitMB)
+        return 1024...upper
+    }
 
     private let pythonPathDefaultsKey = "vcat.pythonInterpreterPath"
     private let descriptionLanguageDefaultsKey = "vcat.descriptionLanguage"
     private let descriptionMaxWordsDefaultsKey = "vcat.descriptionMaxWords"
     private let analysisSegmentSecondsDefaultsKey = "vcat.analysisSegmentSeconds"
     private let subtitleToneDefaultsKey = "vcat.subtitleTone"
+    private let gpuMemoryLimitDefaultsKey = "vcat.gpuMemoryLimitMB"
     private var keyframeInFlight: Set<URL> = []
 
     init() {
+        defer {
+            refreshCurrentGPUMemoryLimit()
+        }
+
         if let storedLang = UserDefaults.standard.string(forKey: descriptionLanguageDefaultsKey) {
             if storedLang == "zh-Hant" {
                 descriptionLanguage = .traditionalChinese
@@ -603,6 +641,11 @@ final class VideoMergeViewModel: ObservableObject {
 
         AppLog.sink = { [weak self] line in
             self?.appendLog(line)
+        }
+
+        if let storedLimit = UserDefaults.standard.object(forKey: gpuMemoryLimitDefaultsKey) as? Int,
+           storedLimit > 0 {
+            configuredGPUMemoryLimitMB = storedLimit
         }
 
         // Priority: user setting -> env var -> repo-local .venv -> system python.
@@ -1099,6 +1142,38 @@ final class VideoMergeViewModel: ObservableObject {
         }
     }
 
+    func exportCombinedDescription() {
+        guard !selectedURLs.isEmpty else {
+            statusMessage = "No videos selected."
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "combined_descriptions.yaml"
+        panel.allowedContentTypes = [UTType(filenameExtension: "yaml") ?? .text]
+
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            statusMessage = "Export canceled."
+            return
+        }
+
+        let yaml = RawDescriptionSidecarWriter.makeYAML(
+            urls: selectedURLs,
+            clipDescriptions: clipDescriptions,
+            clipScenes: clipScenes,
+            clipDurations: clipDurations,
+            clipEngines: clipEngines,
+            clipWarnings: clipWarnings
+        )
+        do {
+            try yaml.write(to: destination, atomically: true, encoding: .utf8)
+            statusMessage = "Combined description exported: \(destination.lastPathComponent)"
+        } catch {
+            statusMessage = "Export failed: \(error.localizedDescription)"
+        }
+    }
+
     func copyDescriptionSRTToClipboard() {
         statusMessage = "Building description SRT..."
         Task {
@@ -1272,6 +1347,108 @@ final class VideoMergeViewModel: ObservableObject {
         }
     }
 
+    func prepareClaudeSubtitleComposer() {
+        do {
+            claudeSubtitlePrompt = try Self.loadFinalSubtitlePrompt()
+            claudeSubtitleYAML = currentGeneratedYAML()
+            claudeSubtitleSourceLabel = "Current generated YAML"
+            if debugLoggingEnabled {
+                appendLog("Claude | composer ready | source=\(claudeSubtitleSourceLabel) promptChars=\(claudeSubtitlePrompt.count) yamlChars=\(claudeSubtitleYAML.count)")
+            }
+            statusMessage = "Claude subtitle composer ready."
+        } catch {
+            if debugLoggingEnabled {
+                appendLog("Claude | composer failed | error=\(error.localizedDescription)")
+            }
+            statusMessage = "Claude prompt load failed: \(error.localizedDescription)"
+        }
+    }
+
+    func chooseClaudeSubtitleYAML() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "yaml") ?? .text,
+            UTType(filenameExtension: "yml") ?? .text,
+            .text
+        ]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.title = "Choose YAML for Claude Subtitle Generation"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            claudeSubtitleYAML = try String(contentsOf: url, encoding: .utf8)
+            claudeSubtitleSourceLabel = url.lastPathComponent
+            if debugLoggingEnabled {
+                appendLog("Claude | yaml loaded | source=\(claudeSubtitleSourceLabel) chars=\(claudeSubtitleYAML.count)")
+            }
+            statusMessage = "Loaded YAML: \(url.lastPathComponent)"
+        } catch {
+            if debugLoggingEnabled {
+                appendLog("Claude | yaml load failed | path=\(url.path) error=\(error.localizedDescription)")
+            }
+            statusMessage = "YAML load failed: \(error.localizedDescription)"
+        }
+    }
+
+    func resetClaudeSubtitleYAMLToCurrent() {
+        claudeSubtitleYAML = currentGeneratedYAML()
+        claudeSubtitleSourceLabel = "Current generated YAML"
+        if debugLoggingEnabled {
+            appendLog("Claude | yaml reset | source=\(claudeSubtitleSourceLabel) chars=\(claudeSubtitleYAML.count)")
+        }
+        statusMessage = "Reset Claude YAML to current generated content."
+    }
+
+    func generateClaudeSubtitleAndImport() {
+        let prompt = claudeSubtitlePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let yaml = claudeSubtitleYAML.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !prompt.isEmpty else {
+            statusMessage = "Claude prompt is empty."
+            return
+        }
+        guard !yaml.isEmpty else {
+            statusMessage = "Claude YAML input is empty."
+            return
+        }
+        guard !isGeneratingClaudeSubtitle else { return }
+
+        isGeneratingClaudeSubtitle = true
+        statusMessage = "Generating subtitles with Claude..."
+        statusDetail = "Sending prompt and YAML to Claude."
+        if debugLoggingEnabled {
+            appendLog("Claude | request start | source=\(claudeSubtitleSourceLabel) promptChars=\(prompt.count) yamlChars=\(yaml.count)")
+        }
+
+        Task {
+            do {
+                let srt = try await ClaudeSubtitleClient.generateSRT(prompt: prompt, yaml: yaml)
+                let importedURL = try self.importGeneratedSRT(srt, sourceLabel: claudeSubtitleSourceLabel)
+                await MainActor.run {
+                    self.importedSRTPath = importedURL.path
+                    if self.debugLoggingEnabled {
+                        self.appendLog("Claude | import success | path=\(importedURL.path) srtChars=\(srt.count) cues=\(self.importedSubtitleEntries.count)")
+                    }
+                    self.isGeneratingClaudeSubtitle = false
+                    self.statusDetail = nil
+                    self.statusMessage = "Claude subtitles imported: \(importedURL.lastPathComponent)"
+                }
+            } catch {
+                await MainActor.run {
+                    if self.debugLoggingEnabled {
+                        self.appendLog("Claude | request failed | error=\(error.localizedDescription)")
+                    }
+                    self.isGeneratingClaudeSubtitle = false
+                    self.statusDetail = nil
+                    self.statusMessage = "Claude subtitle generation failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     func clearImportedSRT() {
         importedSubtitleEntries = []
         importedSRTPath = nil
@@ -1290,6 +1467,83 @@ final class VideoMergeViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func currentGeneratedYAML() -> String {
+        RawDescriptionSidecarWriter.makeYAML(
+            urls: selectedURLs,
+            clipDescriptions: clipDescriptions,
+            clipScenes: clipScenes,
+            clipDurations: clipDurations,
+            clipEngines: clipEngines,
+            clipWarnings: clipWarnings
+        )
+    }
+
+    @MainActor
+    private func importGeneratedSRT(_ text: String, sourceLabel: String) throws -> URL {
+        let cues = SRTParser.parse(text: text)
+        guard !cues.isEmpty else {
+            throw VideoMergeError.exportFailed("Claude returned invalid or empty SRT.")
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("vcat-generated-srt", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let sanitized = sourceLabel
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: " ", with: "_")
+        let fileURL = tempDir.appendingPathComponent("claude_\(sanitized)_\(Self.timestampStamp()).srt")
+        try text.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        importedSubtitleEntries = cues.enumerated().map { idx, cue in
+            TimedScriptEntry(
+                index: idx + 1,
+                url: fileURL,
+                text: cue.text,
+                start: cue.start,
+                duration: cue.duration
+            )
+        }
+        return fileURL
+    }
+
+    private static func timestampStamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return formatter.string(from: Date())
+    }
+
+    private static func loadFinalSubtitlePrompt() throws -> String {
+        guard let url = resolveFinalSubtitlePromptURL() else {
+            throw VideoMergeError.exportFailed("Could not find prompts/final_subtitle.")
+        }
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    private static func resolveFinalSubtitlePromptURL() -> URL? {
+        if let bundled = Bundle.main.url(forResource: "final_subtitle", withExtension: nil) {
+            return bundled
+        }
+
+        let cwdURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("prompts/final_subtitle")
+        if FileManager.default.fileExists(atPath: cwdURL.path) {
+            return cwdURL
+        }
+
+        if let scriptURL = ClipDescriptionBuilder.analyzerScriptURL() {
+            let candidate = scriptURL
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("prompts/final_subtitle")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+
+        return nil
     }
 
     func ensureKeyframes(for url: URL) {
@@ -1591,7 +1845,7 @@ final class VideoMergeViewModel: ObservableObject {
     }
 
     func enableGPUMemoryBoost() {
-        setGPUMemoryLimit(18000)
+        setGPUMemoryLimit(configuredGPUMemoryLimitMB)
     }
 
     func resetGPUMemoryBoost() {
@@ -1614,6 +1868,7 @@ final class VideoMergeViewModel: ObservableObject {
                     self.statusMessage = megabytes > 0
                         ? "GPU boost enabled (\(megabytes) MB)."
                         : "GPU boost reset."
+                    self.refreshCurrentGPUMemoryLimit()
                 case .failure(let error):
                     self.statusMessage = "GPU boost change failed: \(error.localizedDescription)"
                     if self.debugLoggingEnabled {
@@ -1621,6 +1876,44 @@ final class VideoMergeViewModel: ObservableObject {
                     }
                 }
             }
+        }
+    }
+
+    func refreshCurrentGPUMemoryLimit() {
+        guard !isRefreshingGPULimit else { return }
+        isRefreshingGPULimit = true
+
+        Task<Void, Never> {
+            let result = await Self.readCurrentGPUMemoryLimitMB()
+            await MainActor.run {
+                self.isRefreshingGPULimit = false
+                switch result {
+                case .success(let megabytes):
+                    self.currentGPUMemoryLimitMB = megabytes
+                    if megabytes > 0 {
+                        self.currentGPUMemoryLimitDetail = "Current limit: \(megabytes) MB (\(String(format: "%.1f", Double(megabytes) / 1024.0)) GB). Reset restores it by writing 0."
+                    } else {
+                        self.currentGPUMemoryLimitDetail = "Current limit: default system behavior (0 MB override)."
+                    }
+                    if self.debugLoggingEnabled {
+                        self.appendLog("GPU limit read: \(megabytes) MB")
+                    }
+                    self.clampConfiguredGPUMemoryLimitToSystemCeiling()
+                case .failure(let error):
+                    self.currentGPUMemoryLimitMB = nil
+                    self.currentGPUMemoryLimitDetail = "Current limit unavailable. Use Refresh to retry or Reset GPU Boost to restore 0."
+                    if self.debugLoggingEnabled {
+                        self.appendLog("GPU limit read failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    private func clampConfiguredGPUMemoryLimitToSystemCeiling() {
+        let upper = gpuMemoryLimitSystemUpperBoundMB
+        if configuredGPUMemoryLimitMB > upper {
+            configuredGPUMemoryLimitMB = upper
         }
     }
 
@@ -1664,6 +1957,44 @@ final class VideoMergeViewModel: ObservableObject {
         }.value
     }
 
+    private static func readCurrentGPUMemoryLimitMB() async -> Result<Int, Error> {
+        await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/sysctl")
+            process.arguments = ["-n", "iogpu.wired_limit_mb"]
+
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let stdout = String(data: outData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let stderr = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                guard process.terminationStatus == 0 else {
+                    let message = stderr.nilIfEmpty ?? stdout.nilIfEmpty ?? "sysctl exited with status \(process.terminationStatus)."
+                    return .failure(VideoMergeError.exportFailed(message))
+                }
+
+                guard let megabytes = Int(stdout) else {
+                    return .failure(VideoMergeError.exportFailed("Unexpected sysctl output: \(stdout)"))
+                }
+
+                return .success(megabytes)
+            } catch {
+                return .failure(error)
+            }
+        }.value
+    }
+
     private func timestamp() -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1694,8 +2025,7 @@ final class VideoMergeViewModel: ObservableObject {
     }
 
     var analyzerOutputDirectoryPath: String {
-        guard let script = ClipDescriptionBuilder.analyzerScriptURL() else { return "Unavailable" }
-        return script.deletingLastPathComponent().appendingPathComponent("output", isDirectory: true).path
+        ClipDescriptionBuilder.analyzerOutputDirectoryURL().path
     }
 
     func openAnalyzerOutputFolder() {
@@ -2759,9 +3089,112 @@ enum RawDescriptionSidecarWriter {
     }
 }
 
+enum ClaudeSubtitleClient {
+    private static let apiURL = URL(string: "https://api.anthropic.com/v1/messages")!
+    private static let model = "claude-sonnet-4-20250514"
+    private static let anthropicVersion = "2023-06-01"
+
+    private struct RequestBody: Encodable {
+        struct Message: Encodable {
+            let role: String
+            let content: String
+        }
+
+        let model: String
+        let max_tokens: Int
+        let temperature: Double
+        let messages: [Message]
+    }
+
+    private struct ResponseBody: Decodable {
+        struct ContentBlock: Decodable {
+            let type: String
+            let text: String?
+        }
+
+        struct APIError: Decodable {
+            let message: String
+        }
+
+        let content: [ContentBlock]?
+        let error: APIError?
+    }
+
+    static func generateSRT(prompt: String, yaml: String) async throws -> String {
+        let key = try loadAPIKey()
+        AppLog.log("Claude API | key loaded | promptChars=\(prompt.count) yamlChars=\(yaml.count)")
+        var request = URLRequest(url: apiURL)
+        request.httpMethod = "POST"
+        request.setValue(key, forHTTPHeaderField: "x-api-key")
+        request.setValue(anthropicVersion, forHTTPHeaderField: "anthropic-version")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+
+        let message = """
+\(prompt)
+
+YAML input:
+```yaml
+\(yaml)
+```
+"""
+        let body = RequestBody(
+            model: model,
+            max_tokens: 4096,
+            temperature: 0.5,
+            messages: [.init(role: "user", content: message)]
+        )
+        request.httpBody = try JSONEncoder().encode(body)
+        AppLog.log("Claude API | request | model=\(model) bodyBytes=\(request.httpBody?.count ?? 0)")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            AppLog.log("Claude API | invalid response | non-http")
+            throw VideoMergeError.exportFailed("Claude response was not HTTP.")
+        }
+        AppLog.log("Claude API | response | status=\(http.statusCode) bytes=\(data.count)")
+
+        let decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
+        guard (200...299).contains(http.statusCode) else {
+            AppLog.log("Claude API | error | status=\(http.statusCode) message=\(decoded.error?.message ?? "unknown")")
+            throw VideoMergeError.exportFailed(decoded.error?.message ?? "Claude API returned HTTP \(http.statusCode).")
+        }
+
+        let text = (decoded.content ?? [])
+            .filter { $0.type == "text" }
+            .compactMap(\.text)
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !text.isEmpty else {
+            AppLog.log("Claude API | error | empty text response")
+            throw VideoMergeError.exportFailed("Claude returned empty text.")
+        }
+        AppLog.log("Claude API | success | textChars=\(text.count)")
+        return text
+    }
+
+    private static func loadAPIKey() throws -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent(".credentails/claude/api-key-vcat.txt"),
+            home.appendingPathComponent(".credentials/claude/api-key-vcat.txt")
+        ]
+        for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+            let key = try String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !key.isEmpty {
+                AppLog.log("Claude API | key path found | path=\(url.path)")
+                return key
+            }
+        }
+        AppLog.log("Claude API | key missing")
+        throw VideoMergeError.exportFailed("Claude API key file not found.")
+    }
+}
+
 enum ClipDescriptionBuilder {
     private struct ExternalVisualLog: Decodable {
         let timestamp: String?
+        let timestamp_seconds: Double?
         let description: String?
     }
 
@@ -3006,6 +3439,7 @@ enum ClipDescriptionBuilder {
         engine: EngineId
     ) async -> ExternalRun? {
         guard let scriptURL = resolveAnalyzerScriptURL() else { return nil }
+        let outputURL = analyzerOutputDirectoryURL()
 
         return await Task.detached(priority: .userInitiated) {
             let process = Process()
@@ -3040,6 +3474,9 @@ enum ClipDescriptionBuilder {
                 args.append(contentsOf: ["--engine", "florence"])
             }
             process.arguments = args
+            var env = ProcessInfo.processInfo.environment
+            env["VCAT_OUTPUT_DIR"] = outputURL.path
+            process.environment = env
 
             let outPipe = Pipe()
             let errPipe = Pipe()
@@ -3136,11 +3573,35 @@ enum ClipDescriptionBuilder {
         resolveAnalyzerScriptURL()
     }
 
+    static func analyzerOutputDirectoryURL() -> URL {
+        let fileManager = FileManager.default
+        guard let script = resolveAnalyzerScriptURL() else {
+            if let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                return appSupport.appendingPathComponent("VideoCombiner/output", isDirectory: true)
+            }
+            return URL(fileURLWithPath: fileManager.currentDirectoryPath)
+                .appendingPathComponent("tools/descriptiongen/output", isDirectory: true)
+        }
+
+        let bundleResources = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Resources", isDirectory: true)
+            .path
+        if script.path.contains(bundleResources) {
+            if let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                return appSupport.appendingPathComponent("VideoCombiner/output", isDirectory: true)
+            }
+        }
+
+        return script.deletingLastPathComponent()
+            .appendingPathComponent("output", isDirectory: true)
+    }
+
     private static func decodeExternalResult(_ item: ExternalResult, debugLines: [String]) -> Result<DescribeResult, Error> {
         let derivedScenes: [ClipSceneCaption] = (item.visual_logs ?? []).enumerated().compactMap { offset, log in
             let caption = (log.description ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !caption.isEmpty else { return nil }
-            let start = Double(offset)
+            let fallback = Double(offset)
+            let start = log.timestamp_seconds ?? (log.timestamp.flatMap(parseSrtTimestamp) ?? fallback)
             let end = start + 1.0
             return ClipSceneCaption(index: offset, startSeconds: start, endSeconds: end, caption: caption)
         }
@@ -3234,6 +3695,18 @@ enum ClipDescriptionBuilder {
         default:
             return fourCC(mediaSubType)
         }
+    }
+
+    private static func parseSrtTimestamp(_ timestamp: String) -> Double? {
+        let parts = timestamp.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        let hours = Double(parts[0]) ?? 0
+        let minutes = Double(parts[1]) ?? 0
+        let secondsParts = parts[2].split(separator: ",", omittingEmptySubsequences: false)
+        guard let secPart = secondsParts.first else { return nil }
+        let seconds = Double(secPart) ?? 0
+        let milliseconds = secondsParts.count > 1 ? Double(secondsParts[1]) ?? 0 : 0
+        return hours * 3600 + minutes * 60 + seconds + (milliseconds / 1000.0)
     }
 
     static func formatDuration(_ seconds: Double) -> String {
@@ -3410,6 +3883,7 @@ enum ClipDescriptionBuilder {
 struct ContentView: View {
     @StateObject private var vm = VideoMergeViewModel()
     @State private var isShowingPreview = false
+    @State private var isShowingClaudeSubtitleSheet = false
     @State private var expandedDescriptionURLs: Set<URL> = []
 
     var body: some View {
@@ -3590,10 +4064,25 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .disabled(vm.selectedURLs.isEmpty || vm.isGeneratingDescriptions || vm.isExporting)
 
+                Button("Export Combined Description…", action: vm.exportCombinedDescription)
+                    .frame(maxWidth: .infinity)
+                    .buttonStyle(.bordered)
+                    .disabled(vm.selectedURLs.isEmpty || vm.isGeneratingDescriptions || vm.isExporting)
+
                 HStack(spacing: 8) {
                     Button("Copy Desc SRT", action: vm.copyDescriptionSRTToClipboard)
                         .frame(maxWidth: .infinity)
                     Button("Import SRT…", action: vm.importSRT)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(vm.selectedURLs.isEmpty || vm.isGeneratingDescriptions || vm.isExporting)
+
+                Button(action: {
+                    vm.prepareClaudeSubtitleComposer()
+                    isShowingClaudeSubtitleSheet = true
+                }) {
+                    Label("Claude Final SRT", systemImage: "sparkles.rectangle.stack")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
@@ -3742,6 +4231,62 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(vm.isExporting || vm.isGeneratingDescriptions || vm.isConfiguringGPULimit)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Target limit")
+                        Spacer()
+                        Text("\(vm.configuredGPUMemoryLimitMB) MB")
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.custom("Avenir Next Regular", size: 12))
+
+                    Stepper(value: $vm.configuredGPUMemoryLimitMB, in: vm.gpuMemoryLimitRangeMB, step: 1024) {
+                        Text("Adjust GPU limit")
+                    }
+                    .labelsHidden()
+                    .disabled(vm.isExporting || vm.isGeneratingDescriptions || vm.isConfiguringGPULimit)
+
+                    Text("Upper bound \(vm.gpuMemoryLimitRangeMB.upperBound) MB (matches current OS limit or physical RAM).")
+                        .font(.custom("Avenir Next Regular", size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("Current GPU memory limit")
+                        Spacer()
+                        if vm.isRefreshingGPULimit {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else if let current = vm.currentGPUMemoryLimitMB {
+                            Text(current > 0 ? "\(current) MB" : "Default (0)")
+                                .foregroundStyle(current > 0 ? .primary : .secondary)
+                        } else {
+                            Text("Unknown")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.custom("Avenir Next Regular", size: 12))
+
+                    Text(vm.currentGPUMemoryLimitDetail)
+                        .font(.custom("Avenir Next Regular", size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Text("Restore: click Reset GPU Boost. That writes `iogpu.wired_limit_mb=0`.")
+                        .font(.custom("Avenir Next Regular", size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Button(action: vm.refreshCurrentGPUMemoryLimit) {
+                        Label("Refresh Current Limit", systemImage: "arrow.clockwise")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(vm.isExporting || vm.isGeneratingDescriptions || vm.isConfiguringGPULimit || vm.isRefreshingGPULimit)
+                }
             }
             .font(.custom("Avenir Next Regular", size: 13))
 
@@ -3862,27 +4407,26 @@ struct ContentView: View {
 
                                         keyframesView(for: url)
 
-                                        if let timed = vm.timestampedDescription(for: url) {
-                                            let isExpanded = expandedDescriptionURLs.contains(url)
-                                            VStack(alignment: .leading, spacing: 8) {
-                                                VStack(alignment: .leading, spacing: 5) {
-                                                    Text("Scene Notes")
-                                                        .font(.custom("Avenir Next Demi Bold", size: 11))
-                                                        .foregroundStyle(.primary)
-
-                                                    Text(timed)
-                                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                                        .foregroundStyle(.secondary)
-                                                        .lineSpacing(3)
-                                                        .multilineTextAlignment(.leading)
-                                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                                        .lineLimit(isExpanded ? nil : 10)
-                                                        .fixedSize(horizontal: false, vertical: true)
-                                                        .textSelection(.enabled)
-                                                }
-                                                .padding(10)
-                                                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-
+                                        let sceneNotes = vm.timestampedDescription(for: url)
+                                        let isExpanded = expandedDescriptionURLs.contains(url)
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            HStack(alignment: .top) {
+                                                Text("Scene Notes")
+                                                    .font(.custom("Avenir Next Demi Bold", size: 11))
+                                                    .foregroundStyle(.primary)
+                                                Spacer()
+                                                clipGenerateDescriptionButton(for: url)
+                                            }
+                                            if let timed = sceneNotes {
+                                                Text(timed)
+                                                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                                    .foregroundStyle(.secondary)
+                                                    .lineSpacing(3)
+                                                    .multilineTextAlignment(.leading)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                    .lineLimit(isExpanded ? nil : 10)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                                    .textSelection(.enabled)
                                                 Button(action: {
                                                     if isExpanded {
                                                         expandedDescriptionURLs.remove(url)
@@ -3895,26 +4439,29 @@ struct ContentView: View {
                                                 }
                                                 .buttonStyle(.plain)
                                                 .foregroundStyle(.tint)
-                                            }
-                                            if let engine = vm.clipEngines[url] {
-                                                Text("Engine: \(engine)")
-                                                    .font(.custom("Avenir Next Regular", size: 11))
+                                            } else {
+                                                Text("No scene notes yet. Generate descriptions to analyze this clip.")
+                                                    .font(.custom("Avenir Next Regular", size: 12))
                                                     .foregroundStyle(.secondary)
-                                                    .lineLimit(1)
+                                                    .fixedSize(horizontal: false, vertical: true)
                                                     .textSelection(.enabled)
                                             }
-                                            if let warnings = vm.clipWarnings[url], let first = warnings.first, !first.isEmpty {
-                                                Text("Note: \(first)")
-                                                    .font(.custom("Avenir Next Regular", size: 11))
-                                                    .foregroundStyle(.secondary)
-                                                    .lineLimit(2)
-                                                    .textSelection(.enabled)
-                                            }
-                                        } else {
-                                            Text("No scene notes yet. Generate descriptions to analyze this clip.")
-                                                .font(.custom("Avenir Next Regular", size: 12))
+                                        }
+                                        .padding(10)
+                                        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                        if let engine = vm.clipEngines[url] {
+                                            Text("Engine: \(engine)")
+                                                .font(.custom("Avenir Next Regular", size: 11))
                                                 .foregroundStyle(.secondary)
-                                                .fixedSize(horizontal: false, vertical: true)
+                                                .lineLimit(1)
+                                                .textSelection(.enabled)
+                                        }
+                                        if let warnings = vm.clipWarnings[url], let first = warnings.first, !first.isEmpty {
+                                            Text("Note: \(first)")
+                                                .font(.custom("Avenir Next Regular", size: 11))
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(2)
                                                 .textSelection(.enabled)
                                         }
                                     }
@@ -3925,12 +4472,6 @@ struct ContentView: View {
                                     Spacer()
 
                                     VStack(spacing: 10) {
-                                        Button(action: { vm.generateDescription(for: url) }) {
-                                            Image(systemName: "text.magnifyingglass")
-                                        }
-                                        .buttonStyle(.plain)
-                                        .disabled(vm.isExporting || vm.isGeneratingDescriptions)
-
                                         Button(action: { vm.moveUp(index: index) }) {
                                             Image(systemName: "arrow.up")
                                         }
@@ -3977,6 +4518,16 @@ struct ContentView: View {
             }
         }
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func clipGenerateDescriptionButton(for url: URL) -> some View {
+        Button(action: { vm.generateDescription(for: url) }) {
+            Label("Generate description", systemImage: "text.magnifyingglass")
+                .font(.custom("Avenir Next Regular", size: 11))
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .disabled(vm.isExporting || vm.isGeneratingDescriptions)
     }
 
     @ViewBuilder
@@ -4193,6 +4744,86 @@ struct ContentView: View {
                 subtitleStyle: vm.previewSubtitleStyle()
             )
         }
+        .sheet(isPresented: $isShowingClaudeSubtitleSheet) {
+            ClaudeSubtitleComposerSheet(vm: vm)
+        }
+    }
+}
+
+struct ClaudeSubtitleComposerSheet: View {
+    @ObservedObject var vm: VideoMergeViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Claude Final Subtitle")
+                        .font(.system(size: 22, weight: .semibold))
+                    Text("Preview the prompt and YAML input before generating the final SRT.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Close") { dismiss() }
+            }
+
+            HStack(spacing: 8) {
+                Button("Use Current YAML", action: vm.resetClaudeSubtitleYAMLToCurrent)
+                Button("Choose YAML…", action: vm.chooseClaudeSubtitleYAML)
+                Spacer()
+                Text("Source: \(vm.claudeSubtitleSourceLabel)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .textSelection(.enabled)
+            }
+            .buttonStyle(.bordered)
+
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Prompt")
+                        .font(.custom("Avenir Next Demi Bold", size: 12))
+                    TextEditor(text: $vm.claudeSubtitlePrompt)
+                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                        .frame(minHeight: 220)
+                        .padding(8)
+                        .background(Color.black.opacity(0.04), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("YAML Input")
+                        .font(.custom("Avenir Next Demi Bold", size: 12))
+                    TextEditor(text: $vm.claudeSubtitleYAML)
+                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                        .frame(minHeight: 220)
+                        .padding(8)
+                        .background(Color.black.opacity(0.04), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.bordered)
+
+                Button(action: {
+                    vm.generateClaudeSubtitleAndImport()
+                }) {
+                    HStack(spacing: 8) {
+                        if vm.isGeneratingClaudeSubtitle {
+                            ProgressView().scaleEffect(0.7)
+                        }
+                        Text(vm.isGeneratingClaudeSubtitle ? "Generating..." : "Generate")
+                    }
+                    .frame(minWidth: 140)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(vm.isGeneratingClaudeSubtitle || vm.claudeSubtitlePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.claudeSubtitleYAML.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 980, minHeight: 620)
     }
 }
 
